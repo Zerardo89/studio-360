@@ -1,8 +1,16 @@
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs, io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use eframe::egui::{self, Color32, RichText, Stroke, StrokeKind, Ui};
 
-use crate::theme;
+use crate::{
+    app::Job,
+    online::{self, Online},
+    theme,
+};
 
 const LANGUAGES: &[&str] = &[
     "English",
@@ -35,6 +43,7 @@ pub struct Preferences {
     pub performance: bool,
     pub compatibility: bool,
     pub watermark: bool,
+    pub online: bool,
 }
 
 impl Default for Preferences {
@@ -44,6 +53,7 @@ impl Default for Preferences {
             performance: false,
             compatibility: false,
             watermark: false,
+            online: true,
         }
     }
 }
@@ -60,6 +70,11 @@ pub struct Settings {
     path: Option<PathBuf>,
     error: Option<String>,
     cache_cleared: bool,
+    online_cache_size: Option<u64>,
+    online_cache_job: Option<Job<Result<u64, online::Error>>>,
+    online_cache_check: Option<Instant>,
+    online_cache_error: Option<String>,
+    online_cleared: bool,
 }
 
 impl Settings {
@@ -72,6 +87,11 @@ impl Settings {
             path,
             error: None,
             cache_cleared: false,
+            online_cache_size: None,
+            online_cache_job: None,
+            online_cache_check: None,
+            online_cache_error: None,
+            online_cleared: false,
         };
         if read_disk {
             result.load();
@@ -111,8 +131,8 @@ impl Settings {
             .ok_or("Cartella delle impostazioni non valida.")?;
         let prefs = self.preferences;
         let text = format!(
-            "{{\n  \"language\": \"{}\",\n  \"performance\": {},\n  \"compatibility\": {},\n  \"watermark\": {}\n}}\n",
-            LANGUAGES[prefs.language], prefs.performance, prefs.compatibility, prefs.watermark,
+            "{{\n  \"language\": \"{}\",\n  \"performance\": {},\n  \"compatibility\": {},\n  \"watermark\": {},\n  \"online\": {}\n}}\n",
+            LANGUAGES[prefs.language], prefs.performance, prefs.compatibility, prefs.watermark, prefs.online,
         );
         let temporary = parent.join(format!("settings-{}.tmp", std::process::id()));
         let result = fs::create_dir_all(parent)
@@ -125,7 +145,7 @@ impl Settings {
         Ok(())
     }
 
-    pub fn show(&mut self, ui: &mut Ui) -> SettingsAction {
+    pub fn show(&mut self, ui: &mut Ui, online: &Online) -> SettingsAction {
         let before = self.preferences;
         let mut action = SettingsAction::default();
         theme::title(
@@ -142,11 +162,84 @@ impl Settings {
             .show(ui, |ui| {
                 ui.columns(2, |columns| {
                     self.app_card(&mut columns[0], &mut action);
+                    columns[0].add_space(12.0);
+                    self.online_card(&mut columns[0], online);
                     device_card(&mut columns[1]);
                 });
             });
         action.changed = self.preferences != before;
         action
+    }
+
+    fn online_card(&mut self, ui: &mut Ui, online: &Online) {
+        if let Some(result) = Job::take(&mut self.online_cache_job) {
+            match result {
+                Ok(bytes) => {
+                    self.online_cache_size = Some(bytes);
+                    self.online_cache_error = None;
+                }
+                Err(error) => {
+                    self.online_cleared = false;
+                    self.online_cache_error = Some(error.to_string());
+                }
+            }
+        }
+        if self.online_cache_job.is_none()
+            && self
+                .online_cache_check
+                .is_none_or(|check| check.elapsed() >= Duration::from_secs(3))
+        {
+            self.online_cache_check = Some(Instant::now());
+            let online = online.clone();
+            self.online_cache_job = Some(Job::start(ui.ctx(), move || online.cache_size()));
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(3));
+        theme::card(16).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            theme::heading(ui, "Contenuti online");
+            ui.checkbox(
+                &mut self.preferences.online,
+                "Usa internet per musiche ed emoji",
+            );
+            if let Some(bytes) = self.online_cache_size {
+                theme::muted(
+                    ui,
+                    if bytes < 1024 {
+                        format!("Cache online · {bytes} B")
+                    } else if bytes < 1024 * 1024 {
+                        format!("Cache online · {:.1} KiB", bytes as f64 / 1024.0)
+                    } else {
+                        format!("Cache online · {:.1} MiB", bytes as f64 / 1_048_576.0)
+                    },
+                );
+            }
+            if ui
+                .add_enabled(
+                    self.online_cache_job.is_none(),
+                    egui::Button::new("Svuota cache"),
+                )
+                .clicked()
+            {
+                let online = online.clone();
+                self.online_cache_check = Some(Instant::now());
+                self.online_cache_job = Some(Job::start(ui.ctx(), move || online.clear_cache()));
+                self.online_cleared = true;
+            }
+            if let Some(error) = &self.online_cache_error {
+                ui.colored_label(theme::ERROR, error);
+            } else if self.online_cleared
+                && self.online_cache_job.is_none()
+                && self.online_cache_size == Some(0)
+            {
+                ui.colored_label(theme::OK, "Cache online svuotata.");
+            }
+            ui.separator();
+            ui.hyperlink_to(
+                "Openverse · CC BY, CC BY-SA, CC0 e PDM",
+                "https://api.openverse.org/v1/",
+            );
+            ui.hyperlink_to(online::TWEMOJI_CREDIT, online::TWEMOJI_LICENSE);
+        });
     }
 
     fn app_card(&mut self, ui: &mut Ui, action: &mut SettingsAction) {
@@ -292,6 +385,7 @@ fn read_preferences(text: &str) -> Option<Preferences> {
             "\"performance\"" => result.performance = value.parse().ok()?,
             "\"compatibility\"" => result.compatibility = value.parse().ok()?,
             "\"watermark\"" => result.watermark = value.parse().ok()?,
+            "\"online\"" => result.online = value.parse().ok()?,
             _ => {}
         }
     }

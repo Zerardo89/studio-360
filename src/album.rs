@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -7,17 +7,17 @@ use std::{
 };
 
 use eframe::egui::{self, Color32, RichText, Stroke, StrokeKind, Ui};
-use image::{imageops::FilterType, GenericImageView, ImageReader, RgbImage};
+use image::{DynamicImage, ImageFormat, ImageReader, RgbImage};
 
 use crate::{
     app::Job,
     panorama::{Pano, PanoRef},
+    playback::{self, file_name, PanoramaVideo, EDITOR_MAX_WIDTH},
     theme,
 };
 
 const THUMBNAIL: u32 = 160;
-const PANORAMA_ASPECT: f32 = 2.0;
-const EDITOR_MAX_WIDTH: u32 = 4096;
+const THUMBNAIL_SECONDS: f64 = 1.0;
 const TYPES: &[&str] = &[
     "Tutti",
     "Foto",
@@ -72,26 +72,21 @@ pub enum Asset {
 }
 
 impl Asset {
-    pub fn load(&self, examples: &[PanoRef], id: u64) -> Result<PanoRef, String> {
+    pub fn load_photo(&self, examples: &[PanoRef], id: u64) -> Result<PanoRef, String> {
         match self {
-            Self::Example(index) => Ok(Arc::clone(&examples[*index])),
+            Self::Example(index) => examples
+                .get(*index)
+                .cloned()
+                .ok_or("Panorama di esempio mancante.".into()),
             Self::File(path) => {
-                let image = decode(path)?;
-                let (w, h) = image.dimensions();
-                let is_panorama = is_panorama(w, h);
-                let image = if w > EDITOR_MAX_WIDTH {
-                    let h = (u64::from(h) * u64::from(EDITOR_MAX_WIDTH) / u64::from(w)).max(1);
-                    image.resize_exact(EDITOR_MAX_WIDTH, h as u32, FilterType::Triangle)
-                } else {
-                    image
-                };
+                let (image, is_panorama) = decode_photo(path, EDITOR_MAX_WIDTH)?;
                 let (w, h) = image.dimensions();
                 let mut pano = Pano::from_rgb(
                     id,
                     file_name(path),
                     w as usize,
                     h as usize,
-                    image.into_rgb8().into_raw(),
+                    image.into_raw(),
                 );
                 pano.is_panorama = is_panorama;
                 Ok(Arc::new(pano))
@@ -107,18 +102,41 @@ struct Media {
     modified: Option<SystemTime>,
     is_panorama: bool,
     thumbnail: Option<egui::TextureHandle>,
+    video: bool,
+    duration: Option<f64>,
+    thumbnail_error: Option<String>,
 }
 
 struct Scanned {
     path: PathBuf,
     modified: Option<SystemTime>,
-    is_panorama: bool,
-    thumbnail: RgbImage,
+    video: bool,
+    thumbnail: Thumbnail,
 }
+
+#[derive(Clone)]
+struct Thumbnail {
+    is_panorama: bool,
+    rgb: Option<Arc<RgbImage>>,
+    duration: Option<f64>,
+    error: Option<String>,
+}
+
+#[derive(PartialEq, Eq)]
+struct FileStamp(SystemTime, u64);
+
+struct CachedThumbnail {
+    stamp: FileStamp,
+    second: Option<FileStamp>,
+    thumbnail: Thumbnail,
+}
+
+type ThumbnailCache = HashMap<PathBuf, CachedThumbnail>;
 
 struct Scan {
     files: Vec<Scanned>,
     skipped: usize,
+    cache: ThumbnailCache,
 }
 
 type ScanJob = Job<Result<Scan, String>>;
@@ -131,6 +149,7 @@ pub struct Album {
     path_text: String,
     folders: [Option<PathBuf>; 2],
     scans: [Option<ScanJob>; 2],
+    thumbnails: [Arc<ThumbnailCache>; 2],
     scan_feedback: [Option<String>; 2],
     dialog: Option<Job<Option<PathBuf>>>,
     restore_cache: bool,
@@ -146,6 +165,7 @@ impl Album {
             path_text: String::new(),
             folders: [None, None],
             scans: [None, None],
+            thumbnails: Default::default(),
             scan_feedback: [None, None],
             dialog: None,
             restore_cache: false,
@@ -161,6 +181,9 @@ impl Album {
                 modified: None,
                 is_panorama: true,
                 thumbnail: Some(example_thumb(ctx, pano)),
+                video: false,
+                duration: None,
+                thumbnail_error: None,
             });
         }
     }
@@ -177,8 +200,9 @@ impl Album {
         self.scan_feedback[slot] = None;
         self.folders[slot] = Some(path.clone());
         self.media.retain(|item| item.source != source);
+        let cache = Arc::clone(&self.thumbnails[slot]);
         self.scans[slot] = Some(Job::start(ctx, move || {
-            scan_folder(&path, source == Source::Camera)
+            scan_folder(&path, source == Source::Camera, &cache)
         }));
     }
 
@@ -192,6 +216,7 @@ impl Album {
             };
             match result {
                 Ok(scan) => {
+                    self.thumbnails[slot] = Arc::new(scan.cache);
                     self.scan_feedback[slot] = (scan.skipped > 0).then(|| {
                         format!(
                             "Impossibile leggere {} elementi nella cartella.",
@@ -201,12 +226,19 @@ impl Album {
                     self.media.extend(scan.files.into_iter().map(|file| {
                         let name = file_name(&file.path);
                         Media {
-                            thumbnail: Some(upload(ctx, &name, &file.thumbnail)),
+                            thumbnail: file
+                                .thumbnail
+                                .rgb
+                                .as_deref()
+                                .map(|rgb| upload(ctx, &name, rgb)),
                             name,
                             modified: file.modified,
                             source,
                             asset: Asset::File(file.path),
-                            is_panorama: file.is_panorama,
+                            is_panorama: file.thumbnail.is_panorama,
+                            video: file.video,
+                            duration: file.thumbnail.duration,
+                            thumbnail_error: file.thumbnail.error,
                         }
                     }));
                     self.media.sort_by_key(|item| {
@@ -226,6 +258,7 @@ impl Album {
             item.thumbnail = None;
         }
         self.scans = [None, None];
+        self.thumbnails = Default::default();
         self.restore_cache = true;
     }
 
@@ -252,7 +285,7 @@ impl Album {
     pub fn recent(&mut self, ui: &mut Ui) -> Option<Asset> {
         let indexes: Vec<_> = (0..self.media.len().min(4)).collect();
         if indexes.is_empty() {
-            theme::muted(ui, "Le immagini aperte nell’album compariranno qui.");
+            theme::muted(ui, "Le foto e i video dell’album compariranno qui.");
         }
         self.grid(ui, &indexes, false)
     }
@@ -261,7 +294,7 @@ impl Album {
         theme::title(
             ui,
             "Album",
-            "Sfoglia le immagini e scegli quale aprire nell’editor.",
+            "Sfoglia foto e video e scegli quale aprire nell’editor.",
         );
         ui.horizontal(|ui| {
             let field = ui.add_sized(
@@ -326,7 +359,9 @@ impl Album {
             .filter(|(_, item)| {
                 (self.source == 0 || self.source == item.source.index())
                     && match self.filter {
-                        0 | 1 => true,
+                        0 => true,
+                        1 => !item.video,
+                        2 => item.video,
                         3 => item.is_panorama,
                         4 => !item.is_panorama,
                         5 => self.favorite.contains(&item.asset),
@@ -338,17 +373,14 @@ impl Album {
         theme::muted(
             ui,
             if indexes.len() == 1 {
-                "1 immagine".into()
+                "1 elemento".into()
             } else {
-                format!("{} immagini", indexes.len())
+                format!("{} elementi", indexes.len())
             },
         );
         if indexes.is_empty() {
             if !self.scans.iter().any(Option::is_some) {
-                theme::muted(
-                    ui,
-                    "Cambia filtro o scegli una cartella con immagini JPG o PNG.",
-                );
+                theme::muted(ui, "Cambia filtro o scegli una cartella con foto o video.");
             }
             return None;
         }
@@ -388,7 +420,11 @@ impl Album {
                                 } else {
                                     ui.painter().rect_filled(rect, 8, theme::SIDE);
                                 }
-                                let response = response.on_hover_text(&item.name);
+                                let response = if let Some(error) = &item.thumbnail_error {
+                                    response.on_hover_text(format!("{}\n{error}", item.name))
+                                } else {
+                                    response.on_hover_text(&item.name)
+                                };
                                 if response.double_clicked() || (!controls && response.clicked()) {
                                     open = Some(item.asset.clone());
                                 }
@@ -409,6 +445,9 @@ impl Album {
                                         egui::FontId::proportional(12.0),
                                         Color32::WHITE,
                                     );
+                                }
+                                if item.video {
+                                    video_badge(ui, rect, item.duration);
                                 }
                                 egui::Frame::new()
                                     .inner_margin(egui::Margin::symmetric(9, 6))
@@ -493,30 +532,110 @@ fn favorite_button(ui: &mut Ui, selected: bool) -> egui::Response {
     response
 }
 
-fn is_panorama(w: u32, h: u32) -> bool {
-    (w as f32 / h as f32 - PANORAMA_ASPECT).abs() <= 0.12
+fn video_badge(ui: &Ui, rect: egui::Rect, duration: Option<f64>) {
+    let duration = duration.map_or_else(|| "–:––".to_owned(), playback::format_time);
+    let width = 22.0 + duration.len() as f32 * 7.0;
+    let badge = egui::Rect::from_min_size(
+        rect.right_bottom() - egui::vec2(width + 8.0, 30.0),
+        egui::vec2(width, 22.0),
+    );
+    let p = badge.left_center() + egui::vec2(8.0, 0.0);
+    ui.painter()
+        .rect_filled(badge, 6, Color32::from_black_alpha(185));
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            p - egui::vec2(0.0, 4.0),
+            p + egui::vec2(7.0, 0.0),
+            p + egui::vec2(0.0, 4.0),
+        ],
+        Color32::WHITE,
+        Stroke::NONE,
+    ));
+    ui.painter().text(
+        badge.left_center() + egui::vec2(19.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        duration,
+        egui::FontId::monospace(12.0),
+        Color32::WHITE,
+    );
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn decode(path: &Path) -> Result<image::DynamicImage, String> {
-    ImageReader::open(path)
-        .map_err(|e| format!("{}: {e}", file_name(path)))?
+fn decode_photo(path: &Path, max_width: u32) -> Result<(RgbImage, bool), String> {
+    let mut reader = ImageReader::open(path).map_err(|e| format!("{}: {e}", file_name(path)))?;
+    let is_insp = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("insp"));
+    if is_insp {
+        reader.set_format(ImageFormat::Jpeg);
+    }
+    let image = reader
         .decode()
-        .map_err(|e| format!("{}: {e}", file_name(path)))
+        .map_err(|e| format!("{}: {e}", file_name(path)))?;
+    Ok(playback::panorama_photo(
+        image.into_rgb8(),
+        is_insp,
+        max_width,
+    ))
 }
 
-fn scan_folder(path: &Path, recursive: bool) -> Result<Scan, String> {
+fn video_thumbnail(path: &Path) -> Thumbnail {
+    let mut thumbnail = Thumbnail {
+        is_panorama: crate::video::is_insv(path),
+        rgb: None,
+        duration: None,
+        error: None,
+    };
+    let result = (|| {
+        let mut video = PanoramaVideo::open(path, THUMBNAIL)?;
+        thumbnail.is_panorama = video.is_panorama();
+        thumbnail.duration = (video.duration > 0.0).then_some(video.duration);
+        let frame = if video.duration > 0.0 {
+            match video.frame_at(THUMBNAIL_SECONDS) {
+                Ok(Some(frame)) => Some(frame),
+                Ok(None) | Err(_) => PanoramaVideo::open(path, THUMBNAIL)?.next_frame()?,
+            }
+        } else {
+            video.next_frame()?
+        };
+        let (_, rgb) = frame.ok_or("Il video non contiene fotogrammi leggibili.")?;
+        Ok(Arc::new(
+            DynamicImage::ImageRgb8(rgb)
+                .thumbnail(THUMBNAIL, THUMBNAIL)
+                .into_rgb8(),
+        ))
+    })();
+    match result {
+        Ok(rgb) => thumbnail.rgb = Some(rgb),
+        Err(error) => thumbnail.error = Some(error),
+    }
+    thumbnail
+}
+
+fn photo_thumbnail(path: &Path) -> Result<Thumbnail, String> {
+    let (rgb, is_panorama) = decode_photo(path, THUMBNAIL)?;
+    Ok(Thumbnail {
+        is_panorama,
+        duration: None,
+        error: None,
+        rgb: Some(Arc::new(
+            DynamicImage::ImageRgb8(rgb)
+                .thumbnail(THUMBNAIL, THUMBNAIL)
+                .into_rgb8(),
+        )),
+    })
+}
+
+fn stamp(metadata: &fs::Metadata) -> Option<FileStamp> {
+    Some(FileStamp(metadata.modified().ok()?, metadata.len()))
+}
+
+fn scan_folder(path: &Path, recursive: bool, previous: &ThumbnailCache) -> Result<Scan, String> {
     let entries =
         fs::read_dir(path).map_err(|e| format!("Impossibile aprire {}: {e}", path.display()))?;
     let mut directories = vec![entries];
     let mut files = Vec::new();
     let mut skipped = 0;
+    let mut cache = HashMap::new();
     while let Some(entries) = directories.pop() {
         for entry in entries {
             let result = (|| -> io::Result<()> {
@@ -527,25 +646,65 @@ fn scan_folder(path: &Path, recursive: bool) -> Result<Scan, String> {
                     directories.push(fs::read_dir(path)?);
                     return Ok(());
                 }
-                let supported = path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| {
-                        ["jpg", "jpeg", "png"]
+                if !kind.is_file() {
+                    return Ok(());
+                }
+                let video = playback::is_video(&path);
+                if !video
+                    && !path.extension().is_some_and(|ext| {
+                        ["jpg", "jpeg", "png", "insp"]
                             .iter()
                             .any(|valid| ext.eq_ignore_ascii_case(valid))
-                    });
-                if supported && kind.is_file() {
-                    match decode(&path) {
-                        Ok(image) => files.push(Scanned {
-                            modified: entry.metadata().and_then(|m| m.modified()).ok(),
-                            is_panorama: is_panorama(image.width(), image.height()),
-                            thumbnail: image.thumbnail(THUMBNAIL, THUMBNAIL).into_rgb8(),
-                            path,
-                        }),
-                        Err(_) => skipped += 1,
-                    }
+                    })
+                {
+                    return Ok(());
                 }
+                if playback::primary_lens(&path).is_some() {
+                    return Ok(());
+                }
+                let current = entry.metadata().ok().as_ref().and_then(stamp);
+                let second = playback::secondary_lens(&path);
+                let second_stamp = second
+                    .as_ref()
+                    .and_then(|path| path.metadata().ok())
+                    .as_ref()
+                    .and_then(stamp);
+                let cacheable = current.is_some() && (second.is_none() || second_stamp.is_some());
+                let cached = previous.get(&path).filter(|cached| {
+                    cacheable
+                        && current.as_ref() == Some(&cached.stamp)
+                        && second_stamp == cached.second
+                });
+                let thumbnail = if let Some(cached) = cached {
+                    cached.thumbnail.clone()
+                } else if video {
+                    video_thumbnail(&path)
+                } else {
+                    match photo_thumbnail(&path) {
+                        Ok(thumbnail) => thumbnail,
+                        Err(_) => {
+                            skipped += 1;
+                            return Ok(());
+                        }
+                    }
+                };
+                let modified = current.as_ref().map(|stamp| stamp.0);
+                if let Some(stamp) = current.filter(|_| cacheable && thumbnail.error.is_none()) {
+                    cache.insert(
+                        path.clone(),
+                        CachedThumbnail {
+                            stamp,
+                            second: second_stamp,
+                            thumbnail: thumbnail.clone(),
+                        },
+                    );
+                }
+                files.push(Scanned {
+                    path,
+                    modified,
+                    video,
+                    thumbnail,
+                });
                 Ok(())
             })();
             if result.is_err() {
@@ -554,7 +713,49 @@ fn scan_folder(path: &Path, recursive: bool) -> Result<Scan, String> {
         }
     }
     files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    Ok(Scan { files, skipped })
+    Ok(Scan {
+        files,
+        skipped,
+        cache,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn check_video_thumbnails(directory: &Path) -> Result<(), String> {
+    let initial = scan_folder(directory, false, &HashMap::new())?;
+    let cached = scan_folder(directory, false, &initial.cache)?;
+    assert_eq!(initial.skipped, 0);
+    assert_eq!(initial.files.len(), 2);
+    let pair = initial
+        .files
+        .iter()
+        .find(|file| crate::video::is_insv(&file.path))
+        .ok_or("La coppia INSV non appare nell’album")?;
+    assert!(pair.path.ends_with("VID_demo_00_001.insv"));
+    for (original, repeated) in initial.files.iter().zip(&cached.files) {
+        assert!(original.video);
+        assert!(original.thumbnail.is_panorama);
+        assert_eq!(
+            original
+                .thumbnail
+                .duration
+                .map(playback::format_time)
+                .as_deref(),
+            Some("0:02")
+        );
+        let thumb = original
+            .thumbnail
+            .rgb
+            .as_ref()
+            .ok_or_else(|| original.thumbnail.error.clone().unwrap_or_default())?;
+        assert_eq!(thumb.dimensions(), (160, 80));
+        assert!(repeated
+            .thumbnail
+            .rgb
+            .as_ref()
+            .is_some_and(|rgb| Arc::ptr_eq(rgb, thumb)));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -589,4 +790,36 @@ fn example_thumb(ctx: &egui::Context, pano: &Pano) -> egui::TextureHandle {
         .collect::<Vec<_>>();
     let image = egui::ColorImage::from_rgb([width, height], &pixels);
     ctx.load_texture(&pano.name, image, egui::TextureOptions::LINEAR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opens_an_insp_jpeg_and_places_the_two_lenses_on_opposite_sides(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Path::new("target").join(format!("studio360-photo-{}.insp", std::process::id()));
+        let packed = RgbImage::from_fn(128, 64, |x, y| {
+            let radius = (x % 64).abs_diff(32).pow(2) + y.abs_diff(32).pow(2);
+            image::Rgb(if radius >= 32 * 32 {
+                [0, 0, 0]
+            } else if x < 64 {
+                [210, 90, 45]
+            } else {
+                [45, 90, 210]
+            })
+        });
+        packed.save_with_format(&path, ImageFormat::Jpeg)?;
+        let photo = Asset::File(path.clone()).load_photo(&[], 73);
+        fs::remove_file(&path)?;
+        let photo = photo?;
+        assert!(photo.is_panorama);
+        assert_eq!((photo.w, photo.h), (128, 64));
+        let front = (32 * photo.w + 64) * 3;
+        let back = 32 * photo.w * 3;
+        assert!(photo.rgb[front] > 200 && photo.rgb[front + 2] < 60);
+        assert!(photo.rgb[back] < 60 && photo.rgb[back + 2] > 200);
+        Ok(())
+    }
 }

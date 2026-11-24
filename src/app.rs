@@ -1,6 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{mpsc, Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{self, RichText, Stroke, StrokeKind, Ui};
@@ -8,9 +9,11 @@ use eframe::egui::{self, RichText, Stroke, StrokeKind, Ui};
 use crate::{
     album::{Album, Asset},
     capture::Capture,
-    editor::Editor,
+    editor::{Editor, InitialPanel},
     home::{Action, Home},
+    online::Online,
     panorama::{self, PanoRef},
+    playback::{self, Playback},
     settings::Settings,
     theme,
 };
@@ -86,6 +89,7 @@ pub struct Screenshot {
     path: Option<PathBuf>,
     frames: u32,
     result: ScreenshotResult,
+    started: Instant,
 }
 
 impl Screenshot {
@@ -94,14 +98,28 @@ impl Screenshot {
             path: Some(path),
             frames: 0,
             result,
+            started: Instant::now(),
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, ready: bool) {
+    fn update(&mut self, ctx: &egui::Context, ready: bool, error: Option<&str>) {
         const WARMUP_FRAMES: u32 = 120;
+        const TIMEOUT: Duration = Duration::from_secs(20);
         ctx.request_repaint();
         ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
         self.frames = self.frames.saturating_add(1);
+        let failure = error.or_else(|| {
+            (self.started.elapsed() >= TIMEOUT)
+                .then_some("Tempo scaduto in attesa della schermata per lo screenshot.")
+        });
+        if let Some(error) = failure {
+            let mut result = self.result.lock().unwrap_or_else(|e| e.into_inner());
+            if result.is_none() {
+                *result = Some(Err(error.to_owned()));
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         if ready && self.frames >= WARMUP_FRAMES {
             if let Some(path) = self.path.take() {
                 let result = Arc::clone(&self.result);
@@ -159,10 +177,21 @@ pub struct App {
     load_image: Option<Job<Result<PanoRef, String>>>,
     next_id: u64,
     screenshot: Option<Screenshot>,
+    auto_edit_on_open: bool,
+    explicit_file: bool,
+    online: Online,
+    initial_panel: Option<InitialPanel>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, tab: Tab, screenshot: Option<Screenshot>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        tab: Tab,
+        screenshot: Option<Screenshot>,
+        auto_edit: bool,
+        open: Option<PathBuf>,
+        initial_panel: Option<InitialPanel>,
+    ) -> Self {
         theme::configure(&cc.egui_ctx);
         let width = if screenshot.is_some() { 1024 } else { 2048 };
         let generate_examples = Job::start(&cc.egui_ctx, move || {
@@ -171,7 +200,8 @@ impl App {
                 .collect()
         });
         let settings = Settings::new(screenshot.is_none());
-        Self {
+        let online = Online::new(settings.preferences.online);
+        let mut app = Self {
             tab,
             album: Album::new(),
             capture: Capture::default(),
@@ -183,14 +213,22 @@ impl App {
             load_image: None,
             next_id: 100,
             screenshot,
+            auto_edit_on_open: auto_edit && tab == Tab::Modifica,
+            explicit_file: open.is_some(),
+            online,
+            initial_panel: initial_panel.filter(|_| tab == Tab::Modifica),
+        };
+        if let Some(path) = open {
+            app.load_asset(&cc.egui_ctx, Asset::File(path));
         }
+        app
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(examples) = Job::take(&mut self.generate_examples) {
             self.examples = examples;
             self.album.add_examples(ctx, &self.examples);
-            if !self.editor.has_image() && self.load_image.is_none() {
+            if !self.explicit_file && !self.editor.has_image() && !self.editor.loading {
                 if let Some(first) = self.examples.first() {
                     self.editor.set_image(Arc::clone(first));
                 }
@@ -201,12 +239,13 @@ impl App {
             self.tab = Tab::Album;
         }
         self.album.poll(ctx);
+        self.editor.poll_video(ctx, self.tab == Tab::Modifica);
         if let Some(result) = Job::take(&mut self.load_image) {
             self.editor.loading = false;
             match result {
                 Ok(pano) => self.editor.set_image(pano),
                 Err(error) => {
-                    if !self.editor.has_image() {
+                    if !self.explicit_file && !self.editor.has_image() {
                         if let Some(first) = self.examples.first() {
                             self.editor.set_image(Arc::clone(first));
                         }
@@ -216,21 +255,45 @@ impl App {
                 }
             }
         }
+        if self.auto_edit_on_open && self.editor.has_image() && !self.editor.loading {
+            self.editor.open_auto_edit(ctx, true);
+            self.auto_edit_on_open = false;
+        }
+        if self.editor.has_image() && !self.editor.loading {
+            if let Some(panel) = self.initial_panel.take() {
+                self.editor
+                    .open_initial_panel(ctx, panel, self.screenshot.is_some(), &self.online);
+            }
+        }
         self.editor.export.poll();
     }
 
-    fn open_image(&mut self, ctx: &egui::Context, asset: Asset) {
+    fn open_asset(&mut self, ctx: &egui::Context, asset: Asset) {
+        self.explicit_file = false;
         self.tab = Tab::Modifica;
+        self.load_asset(ctx, asset);
+    }
+
+    fn load_asset(&mut self, ctx: &egui::Context, asset: Asset) {
         self.editor.load_message = None;
         self.editor.loading = true;
+        let id = self.next_id;
+        self.next_id += 1;
+        if let Asset::File(path) = &asset {
+            if playback::is_video(path) {
+                self.load_image = None;
+                self.editor
+                    .start_video(Playback::start(ctx, path.clone(), id), path.clone());
+                return;
+            }
+        }
+        self.editor.stop_video();
         let examples = if matches!(asset, Asset::Example(_)) {
             self.examples.clone()
         } else {
             Vec::new()
         };
-        let id = self.next_id;
-        self.next_id += 1;
-        self.load_image = Some(Job::start(ctx, move || asset.load(&examples, id)));
+        self.load_image = Some(Job::start(ctx, move || asset.load_photo(&examples, id)));
     }
 
     fn sidebar(&mut self, ui: &mut Ui) {
@@ -324,12 +387,12 @@ impl App {
         match self.tab {
             Tab::Home => match self.home.show(ui, &mut self.album) {
                 Some(Action::Go(tab)) => self.tab = tab,
-                Some(Action::Open(asset)) => self.open_image(ui.ctx(), asset),
+                Some(Action::Open(asset)) => self.open_asset(ui.ctx(), asset),
                 None => {}
             },
             Tab::Album => {
                 if let Some(asset) = self.album.show(ui) {
-                    self.open_image(ui.ctx(), asset);
+                    self.open_asset(ui.ctx(), asset);
                 }
             }
             Tab::Scatto => self.capture.show(
@@ -337,12 +400,14 @@ impl App {
                 self.examples.first(),
                 preferences.performance || preferences.compatibility,
             ),
-            Tab::Modifica => {
-                self.editor
-                    .show(ui, preferences.performance, preferences.compatibility)
-            }
+            Tab::Modifica => self.editor.show(
+                ui,
+                preferences.performance,
+                preferences.compatibility,
+                &self.online,
+            ),
             Tab::Impostazioni => {
-                let action = self.settings.show(ui);
+                let action = self.settings.show(ui, &self.online);
                 if action.clear_cache {
                     self.album.clear_cache();
                 }
@@ -351,6 +416,7 @@ impl App {
                     self.tab = Tab::Modifica;
                 }
                 if action.changed {
+                    self.online.set_enabled(self.settings.preferences.online);
                     if preferences.watermark != self.settings.preferences.watermark {
                         self.editor
                             .export
@@ -376,10 +442,15 @@ impl eframe::App for App {
             let ready = match self.tab {
                 Tab::Home | Tab::Album => !self.examples.is_empty(),
                 Tab::Scatto => self.capture.ready(),
-                Tab::Modifica => self.editor.ready(),
+                Tab::Modifica => !self.auto_edit_on_open && self.editor.ready(),
                 Tab::Impostazioni => true,
             };
-            screenshot.update(ui.ctx(), ready);
+            let error = if self.explicit_file && self.tab == Tab::Modifica {
+                self.editor.load_message.as_deref()
+            } else {
+                None
+            };
+            screenshot.update(ui.ctx(), ready, error);
         }
     }
 }

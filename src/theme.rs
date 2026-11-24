@@ -11,6 +11,18 @@ pub const ERROR: Color32 = Color32::from_rgb(255, 151, 139);
 pub const OK: Color32 = Color32::from_rgb(142, 217, 173);
 
 pub fn configure(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let emoji = crate::overlay_editor::EMOJI_FONT;
+    fonts.font_data.insert(
+        emoji.into(),
+        std::sync::Arc::new(egui::FontData::from_static(
+            epaint_default_fonts::NOTO_EMOJI_REGULAR,
+        )),
+    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Name(emoji.into()), vec![emoji.into()]);
+    ctx.set_fonts(fonts);
     ctx.set_theme(egui::Theme::Dark);
     ctx.style_mut_of(egui::Theme::Dark, |style| {
         let v = &mut style.visuals;

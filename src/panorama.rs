@@ -29,8 +29,7 @@ impl Pano {
     /// Bilinear sample at longitude (-PI..PI) and latitude (-PI/2..PI/2).
     #[inline]
     fn sample(&self, lon: f32, lat: f32, sharpness: f32) -> [f32; 3] {
-        let u = (lon / (2.0 * PI) + 0.5) * self.w as f32 - 0.5;
-        let v = (0.5 - lat / PI) * self.h as f32 - 0.5;
+        let (u, v) = equirectangular_uv(lon, lat, (self.w, self.h));
         self.sample_detail(u, v, true, sharpness)
     }
 
@@ -92,6 +91,12 @@ impl Pano {
     }
 }
 
+pub(crate) fn equirectangular_uv(lon: f32, lat: f32, (w, h): (usize, usize)) -> (f32, f32) {
+    let u = (lon / (2.0 * PI) + 0.5) * w as f32 - 0.5;
+    let v = (0.5 - lat / PI) * h as f32 - 0.5;
+    (u, v)
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Projection {
     /// Ordinary perspective view.
@@ -109,6 +114,16 @@ pub struct View {
     /// Horizontal field of view in degrees.
     pub fov: f32,
     pub projection: Projection,
+}
+
+pub(crate) fn interpolate_view(a: View, b: View, t: f32) -> View {
+    let delta_yaw = (b.yaw - a.yaw + 180.0).rem_euclid(360.0) - 180.0;
+    View {
+        yaw: (a.yaw + delta_yaw * t + 180.0).rem_euclid(360.0) - 180.0,
+        pitch: a.pitch + (b.pitch - a.pitch) * t,
+        fov: a.fov + (b.fov - a.fov) * t,
+        projection: a.projection,
+    }
 }
 
 impl Default for View {
@@ -139,6 +154,42 @@ pub const ADJUST_NAMES: [&str; 13] = [
     "Tinta",
 ];
 
+pub(crate) const FILTERS: &[(&str, &[(usize, f32)])] = &[
+    ("Default", &[]),
+    ("Film", &[(2, 12.0), (3, -15.0), (8, 18.0), (11, 15.0)]),
+    ("Vintage", &[(2, -25.0), (3, -29.0), (7, -15.0), (11, 38.0)]),
+    ("City", &[(2, 28.0), (3, -18.0), (9, 19.0), (11, -20.0)]),
+    ("Scenery", &[(3, 18.0), (4, 28.0), (5, -19.0), (9, 14.0)]),
+    ("Night", &[(0, -16.0), (6, 22.0), (11, -24.0), (12, 11.0)]),
+    ("Portrait", &[(1, 9.0), (2, -13.0), (5, -10.0), (11, 10.0)]),
+    ("Sport", &[(2, 25.0), (4, 18.0), (9, 18.0)]),
+    ("Food", &[(1, 6.0), (3, 24.0), (11, 24.0)]),
+    ("Warm", &[(3, 8.0), (11, 52.0)]),
+    ("Cold", &[(11, -52.0), (12, 14.0)]),
+    ("Mono", &[(3, -100.0), (2, 19.0)]),
+    ("Creative", &[(3, 34.0), (8, 21.0), (12, 50.0)]),
+    ("Indoor", &[(0, 12.0), (5, -22.0), (6, 19.0), (11, -16.0)]),
+];
+
+pub(crate) fn preset(index: usize) -> Adjust {
+    let mut result = Adjust::default();
+    let (name, sliders) = FILTERS.get(index).copied().unwrap_or(FILTERS[0]);
+    for &(slider, value) in sliders {
+        result.v[slider] = value;
+    }
+    result.mono = name == "Mono";
+    result
+}
+
+pub(crate) const EXPOSURE_STOPS: f32 = 2.0;
+pub(crate) const TEMPERATURE_OFFSET: f32 = 0.10;
+pub(crate) const TINT_OFFSET: f32 = 0.08;
+
+#[inline]
+pub(crate) fn luminance([r, g, b]: [f32; 3]) -> f32 {
+    0.299 * r + 0.587 * g + 0.114 * b
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Adjust {
     pub v: [f32; 13],
@@ -166,14 +217,14 @@ impl Adjust {
         let s = |i: usize| self.v[i] / 100.0;
         let [mut r, mut g, mut b] = c;
         // Exposure: up to +/- 2 stops.
-        let e = 2f32.powf(s(0) * 2.0);
+        let e = 2f32.powf(s(0) * EXPOSURE_STOPS);
         r *= e;
         g *= e;
         b *= e;
         // Temperature and tint.
-        r += s(11) * 0.10;
-        b -= s(11) * 0.10;
-        g -= s(12) * 0.08;
+        r += s(11) * TEMPERATURE_OFFSET;
+        b -= s(11) * TEMPERATURE_OFFSET;
+        g -= s(12) * TINT_OFFSET;
         // Brightness.
         let br = s(1) * 0.25;
         r += br;
@@ -187,9 +238,8 @@ impl Adjust {
             g = (g - bp) * k;
             b = (b - bp) * k;
         }
-        let luma = |r: f32, g: f32, b: f32| 0.299 * r + 0.587 * g + 0.114 * b;
         // Highlights, shadows and brilliance work on luminance.
-        let l = luma(r, g, b).clamp(0.0, 1.0);
+        let l = luminance([r, g, b]).clamp(0.0, 1.0);
         let hi = if l > 0.5 { (l - 0.5) * 2.0 } else { 0.0 };
         let lo = if l < 0.5 { (0.5 - l) * 2.0 } else { 0.0 };
         let mut dl = s(5) * 0.25 * hi + s(6) * 0.25 * lo;
@@ -204,7 +254,7 @@ impl Adjust {
         g = (g - 0.5) * k + 0.5;
         b = (b - 0.5) * k + 0.5;
         // Saturation and vibrance.
-        let l = luma(r, g, b);
+        let l = luminance([r, g, b]);
         let maxc = r.max(g).max(b);
         let minc = r.min(g).min(b);
         let sat_now = if maxc > 0.0 {
@@ -225,6 +275,44 @@ impl Adjust {
 }
 
 pub const FRAME_ASPECT: f32 = 16.0 / 9.0;
+
+/// A perspective camera shared by rendering and view analysis.
+#[derive(Clone, Copy)]
+pub(crate) struct Rectilinear {
+    sin_yaw: f32,
+    cos_yaw: f32,
+    sin_pitch: f32,
+    cos_pitch: f32,
+    scale: f32,
+}
+
+impl Rectilinear {
+    pub(crate) fn new(view: &View) -> Self {
+        let (sin_yaw, cos_yaw) = view.yaw.to_radians().sin_cos();
+        let (sin_pitch, cos_pitch) = view.pitch.to_radians().sin_cos();
+        Self {
+            sin_yaw,
+            cos_yaw,
+            sin_pitch,
+            cos_pitch,
+            scale: (view.fov.to_radians() * 0.5).tan(),
+        }
+    }
+
+    /// Return longitude, latitude and the length of the unnormalised ray.
+    #[inline]
+    pub(crate) fn project(&self, nx: f32, ny: f32) -> (f32, f32, f32) {
+        let dx = nx * self.scale;
+        let dy = ny * self.scale / FRAME_ASPECT;
+        // Pitch around X, then yaw around Y. The forward component is one.
+        let pitched_y = dy * self.cos_pitch + self.sin_pitch;
+        let pitched_z = -dy * self.sin_pitch + self.cos_pitch;
+        let x = dx * self.cos_yaw + pitched_z * self.sin_yaw;
+        let z = -dx * self.sin_yaw + pitched_z * self.cos_yaw;
+        let len = (x * x + pitched_y * pitched_y + z * z).sqrt();
+        (x.atan2(z), (pitched_y / len).clamp(-1.0, 1.0).asin(), len)
+    }
+}
 
 /// Fraction of the full 16:9 view included in a centered crop.
 #[derive(Clone, Copy)]
@@ -268,11 +356,8 @@ pub fn render(
     let identity = adj.is_identity();
     let sharpness = adj.v[10] / 100.0;
     let yaw = view.yaw.to_radians();
-    let pitch = view.pitch.to_radians();
-    let (sy, cy) = yaw.sin_cos();
-    let (sp, cp) = pitch.sin_cos();
     let fov = view.fov.to_radians();
-    let rectilinear_scale = (fov * 0.5).tan();
+    let rectilinear = Rectilinear::new(view);
     let stereographic_scale = (fov * 0.25).tan();
     let flat = Region::crop(pano.w as f32 / pano.h as f32);
     std::thread::scope(|scope| {
@@ -289,15 +374,8 @@ pub fn render(
                         let mut c = if pano.is_panorama {
                             let (lon, lat) = match view.projection {
                                 Projection::Rectilinear => {
-                                    let t = rectilinear_scale;
-                                    let (dx, dy, dz) = (nx * t, ny * t / FRAME_ASPECT, 1.0f32);
-                                    // Pitch around X, then yaw around Y.
-                                    let dy2 = dy * cp + dz * sp;
-                                    let dz2 = -dy * sp + dz * cp;
-                                    let dx3 = dx * cy + dz2 * sy;
-                                    let dz3 = -dx * sy + dz2 * cy;
-                                    let len = (dx3 * dx3 + dy2 * dy2 + dz3 * dz3).sqrt();
-                                    (dx3.atan2(dz3), (dy2 / len).clamp(-1.0, 1.0).asin())
+                                    let (lon, lat, _) = rectilinear.project(nx, ny);
+                                    (lon, lat)
                                 }
                                 Projection::Stereographic => {
                                     // Angle from the nadir grows with distance from the centre.
