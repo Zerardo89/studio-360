@@ -1,0 +1,11 @@
+[build]
+# Il wrapper risolve il percorso dello shim anche per le dipendenze.
+rustc-wrapper = "tools/bin/dlltool.exe"
+
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld.exe"
+rustflags = [
+    "-C", "dlltool=tools/bin/dlltool.exe",
+    "-C", "linker-flavor=ld.lld",
+    "-C", "link-self-contained=yes",
+]
