@@ -146,6 +146,32 @@ pub struct Analysis {
     pub color: Adjust,
 }
 
+pub fn show_analysis_source(
+    ui: &mut eframe::egui::Ui,
+    source: &crate::ai_provider::AnalysisSource,
+) {
+    use crate::{ai_provider::AnalysisSource, theme};
+
+    match source {
+        AnalysisSource::Personal { model, title } => {
+            theme::muted(ui, format!("Analisi: AI personale ({model})"));
+            if let Some(title) = title {
+                ui.label(title);
+            }
+        }
+        AnalysisSource::Local(reason) => {
+            theme::muted(ui, "Analisi locale");
+            theme::muted(
+                ui,
+                format!(
+                    "AI personale non disponibile: {}. Uso l’analisi locale.",
+                    reason.trim_end_matches('.')
+                ),
+            );
+        }
+    }
+}
+
 struct AnalysisImage {
     width: usize,
     height: usize,

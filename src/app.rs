@@ -199,7 +199,10 @@ impl App {
                 .map(|index| Arc::new(panorama::generate_sample(index, width)))
                 .collect()
         });
-        let settings = Settings::new(screenshot.is_none());
+        let settings = Settings::new(
+            screenshot.is_none(),
+            screenshot.is_some() && tab == Tab::Impostazioni,
+        );
         let online = Online::new(settings.preferences.online);
         let mut app = Self {
             tab,
@@ -255,14 +258,22 @@ impl App {
                 }
             }
         }
-        if self.auto_edit_on_open && self.editor.has_image() && !self.editor.loading {
-            self.editor.open_auto_edit(ctx, true);
-            self.auto_edit_on_open = false;
-        }
         if self.editor.has_image() && !self.editor.loading {
-            if let Some(panel) = self.initial_panel.take() {
+            let panel = self.initial_panel.take();
+            let auto_create = std::mem::take(&mut self.auto_edit_on_open);
+            if auto_create && !matches!(panel, Some(InitialPanel::Templates)) {
                 self.editor
-                    .open_initial_panel(ctx, panel, self.screenshot.is_some(), &self.online);
+                    .open_auto_edit(ctx, true, &self.settings, &self.online);
+            }
+            if let Some(panel) = panel {
+                self.editor.open_initial_panel(
+                    ctx,
+                    panel,
+                    self.screenshot.is_some(),
+                    auto_create,
+                    &self.settings,
+                    &self.online,
+                );
             }
         }
         self.editor.export.poll();
@@ -380,7 +391,6 @@ impl App {
     }
 
     fn workspace(&mut self, ui: &mut Ui) {
-        let preferences = self.settings.preferences;
         if matches!(self.tab, Tab::Home | Tab::Album) {
             self.album.ensure_cache(ui.ctx(), &self.examples);
         }
@@ -398,15 +408,11 @@ impl App {
             Tab::Scatto => self.capture.show(
                 ui,
                 self.examples.first(),
-                preferences.performance || preferences.compatibility,
+                self.settings.preferences.performance || self.settings.preferences.compatibility,
             ),
-            Tab::Modifica => self.editor.show(
-                ui,
-                preferences.performance,
-                preferences.compatibility,
-                &self.online,
-            ),
+            Tab::Modifica => self.editor.show(ui, &self.settings, &self.online),
             Tab::Impostazioni => {
+                let watermark = self.settings.preferences.watermark;
                 let action = self.settings.show(ui, &self.online);
                 if action.clear_cache {
                     self.album.clear_cache();
@@ -417,7 +423,7 @@ impl App {
                 }
                 if action.changed {
                     self.online.set_enabled(self.settings.preferences.online);
-                    if preferences.watermark != self.settings.preferences.watermark {
+                    if watermark != self.settings.preferences.watermark {
                         self.editor
                             .export
                             .set_watermark(self.settings.preferences.watermark);

@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -10,12 +10,14 @@ use std::{
 use eframe::egui::{self, Color32, Rect, RichText, Stroke, StrokeKind, Ui};
 
 use crate::{
+    ai_provider::{self, AiAnalysis, AnalysisSource, Thumbnail},
     app::Job,
     autoedit::{
         self, Highlight, ANALYSIS_PROGRESS_END, COLOR_SLIDERS, COMPLETE_PROGRESS, MAX_SCORE,
         THUMBNAIL_SIZE,
     },
     export::Export,
+    movie::Filter,
     movie_editor::MovieEditor,
     online::Online,
     overlay_editor::OverlayEditor,
@@ -23,6 +25,7 @@ use crate::{
         self, preset, Adjust, PanoRef, Projection, Region, View, ADJUST_NAMES, FILTERS,
         FRAME_ASPECT,
     },
+    settings::Settings,
     theme,
 };
 
@@ -82,6 +85,7 @@ pub enum InitialPanel {
     Music,
     Sticker,
     Text,
+    Templates,
 }
 
 impl InitialPanel {
@@ -90,6 +94,7 @@ impl InitialPanel {
             "musica" => Some(Self::Music),
             "sticker" => Some(Self::Sticker),
             "testo" => Some(Self::Text),
+            "modelli" => Some(Self::Templates),
             _ => None,
         }
     }
@@ -214,6 +219,13 @@ struct AutoEdit {
     previous: EditorState,
     source: PanoRef,
     state: AutoEditState,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for AutoEdit {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 enum AutoEditState {
@@ -225,6 +237,8 @@ enum AutoEditState {
         clips: Vec<Clip>,
         color: Adjust,
         before_color: Option<Adjust>,
+        source: AnalysisSource,
+        suggested_filter: Option<Filter>,
     },
     Failed,
 }
@@ -232,6 +246,7 @@ enum AutoEditState {
 struct RenderedHighlights {
     color: Adjust,
     clips: Vec<(Highlight, Vec<u8>)>,
+    ai: AiAnalysis,
 }
 
 struct Clip {
@@ -327,6 +342,8 @@ impl Editor {
         ctx: &egui::Context,
         panel: InitialPanel,
         demo: bool,
+        auto_create: bool,
+        settings: &Settings,
         online: &Online,
     ) {
         self.panel = match panel {
@@ -338,6 +355,13 @@ impl Editor {
             }
             InitialPanel::Sticker => STICKER_PANEL,
             InitialPanel::Text => TEXT_PANEL,
+            InitialPanel::Templates => {
+                if let Some(movie) = &mut self.movie {
+                    movie.open_template_hub(demo);
+                    self.open_auto_edit(ctx, demo || auto_create, settings, online);
+                }
+                return;
+            }
         };
         if matches!(panel, InitialPanel::Sticker | InitialPanel::Text) {
             if let Some(movie) = &mut self.movie {
@@ -381,12 +405,18 @@ impl Editor {
             )
     }
 
-    pub fn open_auto_edit(&mut self, ctx: &egui::Context, auto_create: bool) {
+    pub fn open_auto_edit(
+        &mut self,
+        ctx: &egui::Context,
+        auto_create: bool,
+        settings: &Settings,
+        online: &Online,
+    ) {
         if let Some(movie) = &mut self.movie {
             if let Some(video) = &mut self.video {
                 video.pause();
             }
-            movie.analyze(ctx, auto_create);
+            movie.analyze(ctx, auto_create, settings, online);
             self.panel = AUTO_EDIT_PANEL;
             return;
         }
@@ -410,34 +440,56 @@ impl Editor {
             let analysis_source = Arc::clone(&source);
             let progress = Arc::new(AtomicU8::new(0));
             let meter = Arc::clone(&progress);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let cancelled = Arc::clone(&cancel);
+            let client = settings.ai_for_auto_edit();
+            let has_ai = client.is_ok();
+            let online = online.clone();
             let job = Job::start(ctx, move || {
-                let analysis = autoedit::analyze(&analysis_source, |percent| {
-                    meter.store(percent, Ordering::Relaxed)
-                })?;
+                let update = |percent| {
+                    meter.store(
+                        ai_provider::local_progress(percent, has_ai),
+                        Ordering::Relaxed,
+                    );
+                };
+                let analysis = autoedit::analyze(&analysis_source, update)?;
                 let count = analysis.highlights.len();
-                let clips = analysis
-                    .highlights
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, highlight)| {
-                        let rgb = panorama::render(
-                            &analysis_source,
-                            &highlight.view,
-                            &Adjust::default(),
-                            THUMBNAIL_SIZE,
-                            Region::FULL,
-                            None,
-                        );
-                        let done = usize::from(COMPLETE_PROGRESS - ANALYSIS_PROGRESS_END)
-                            * (index + 1)
-                            / count;
-                        meter.store(ANALYSIS_PROGRESS_END + done as u8, Ordering::Relaxed);
-                        (highlight, rgb)
+                let mut clips = Vec::with_capacity(count);
+                for (index, highlight) in analysis.highlights.into_iter().enumerate() {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    let rgb = panorama::render(
+                        &analysis_source,
+                        &highlight.view,
+                        &Adjust::default(),
+                        THUMBNAIL_SIZE,
+                        Region::FULL,
+                        None,
+                    );
+                    let done = usize::from(COMPLETE_PROGRESS - ANALYSIS_PROGRESS_END) * (index + 1)
+                        / count;
+                    update(ANALYSIS_PROGRESS_END + done as u8);
+                    clips.push((highlight, rgb));
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let candidates: Vec<_> = clips
+                    .iter()
+                    .map(|(highlight, rgb)| Thumbnail {
+                        score: highlight.score,
+                        rgb,
+                        size: THUMBNAIL_SIZE,
                     })
                     .collect();
+                let ai = ai_provider::analyze(client, &candidates, online.enabled(), |phase| {
+                    meter.store(phase, Ordering::Relaxed);
+                });
                 Some(RenderedHighlights {
                     color: analysis.color,
                     clips,
+                    ai,
                 })
             });
             self.auto_edit = Some(AutoEdit {
@@ -447,6 +499,7 @@ impl Editor {
                     job: Some(job),
                     progress,
                 },
+                cancel,
             });
         }
         self.panel = AUTO_EDIT_PANEL;
@@ -468,7 +521,7 @@ impl Editor {
             return;
         };
         if let Some(Some(rendered)) = Job::take(job) {
-            let clips = rendered
+            let mut clips: Vec<_> = rendered
                 .clips
                 .into_iter()
                 .enumerate()
@@ -486,10 +539,28 @@ impl Editor {
                     }
                 })
                 .collect();
+            let mut suggested_filter = None;
+            if let Some(verdict) = rendered.ai.verdict {
+                for change in verdict.clips {
+                    let clip = &mut clips[change.index];
+                    change.apply(
+                        &mut clip.highlight.score,
+                        &mut clip.highlight.scene,
+                        &mut clip.selected,
+                    );
+                }
+                clips.sort_by_key(|clip| std::cmp::Reverse(clip.highlight.score));
+                suggested_filter = verdict.filter;
+                if let Some(filter) = suggested_filter {
+                    self.filter = filter.0;
+                }
+            }
             session.state = AutoEditState::Finished {
                 clips,
                 color: rendered.color,
                 before_color: None,
+                source: rendered.ai.source,
+                suggested_filter,
             };
         } else if job.is_none() {
             session.state = AutoEditState::Failed;
@@ -498,7 +569,7 @@ impl Editor {
 
     fn undo_auto_edit(&mut self) {
         if let Some(session) = self.auto_edit.take() {
-            let previous = session.previous;
+            let previous = &session.previous;
             self.view = previous.view;
             self.gear = previous.gear;
             self.adjust = previous.adjust;
@@ -509,7 +580,9 @@ impl Editor {
         }
     }
 
-    pub fn show(&mut self, ui: &mut Ui, performance: bool, compatibility: bool, online: &Online) {
+    pub fn show(&mut self, ui: &mut Ui, settings: &Settings, online: &Online) {
+        let performance = settings.preferences.performance;
+        let compatibility = settings.preferences.compatibility;
         self.poll_auto_edit(ui.ctx());
         theme::title(
             ui,
@@ -552,7 +625,7 @@ impl Editor {
             .exact_size(width)
             .frame(theme::card(12))
             .show(ui, |ui| {
-                self.tools(ui, &visible, online);
+                self.tools(ui, &visible, settings, online);
             });
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let width = (ui.available_width() - 12.0).max(1.0);
@@ -773,7 +846,7 @@ impl Editor {
         self.gear = gear;
     }
 
-    fn tools(&mut self, ui: &mut Ui, pano: &PanoRef, online: &Online) {
+    fn tools(&mut self, ui: &mut Ui, pano: &PanoRef, settings: &Settings, online: &Online) {
         ui.set_min_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
             for (index, tab) in TABS.iter().enumerate() {
@@ -789,7 +862,7 @@ impl Editor {
                 theme::primary("Auto Edit").selected(self.panel == AUTO_EDIT_PANEL),
             );
             if auto_edit.clicked() {
-                self.open_auto_edit(ui.ctx(), false);
+                self.open_auto_edit(ui.ctx(), false, settings, online);
             }
             if !pano.is_panorama && self.movie.is_none() {
                 auto_edit.on_disabled_hover_text("Disponibile per i panorami 360°.");
@@ -800,9 +873,6 @@ impl Editor {
                 self.panel = MUSIC_PANEL;
             }
         });
-        if self.panel == AUTO_EDIT_PANEL {
-            theme::muted(ui, "L’analisi avviene sul PC.");
-        }
         ui.add_space(4.0);
         ui.separator();
         ui.add_space(4.0);
@@ -838,6 +908,7 @@ impl Editor {
                             color,
                             self.export.watermark(),
                             pano.is_panorama,
+                            settings,
                             online,
                         );
                     } else {
@@ -879,23 +950,26 @@ impl Editor {
         };
         match &mut session.state {
             AutoEditState::Analyzing { progress, .. } => {
-                let percent = progress.load(Ordering::Relaxed);
-                theme::muted(
-                    ui,
-                    format!("Analisi di soggetti, scene e momenti salienti… {percent}%"),
+                let (fraction, label) = ai_provider::progress_display(
+                    progress.load(Ordering::Relaxed),
+                    "Analisi di soggetti, scene e momenti salienti…",
                 );
-                ui.add(
-                    egui::ProgressBar::new(f32::from(percent) / f32::from(COMPLETE_PROGRESS))
-                        .fill(theme::ACCENT),
-                );
+                theme::muted(ui, label);
+                ui.add(egui::ProgressBar::new(fraction).fill(theme::ACCENT));
                 ui.ctx().request_repaint_after(AUTO_EDIT_PROGRESS_REFRESH);
             }
             AutoEditState::Finished {
                 clips,
                 color,
                 before_color,
+                source,
+                suggested_filter,
             } => {
+                autoedit::show_analysis_source(ui, source);
                 theme::heading(ui, "Momenti salienti");
+                if let Some(filter) = suggested_filter {
+                    theme::muted(ui, format!("Filtro suggerito · {}", FILTERS[filter.0].0));
+                }
                 if clips.is_empty() {
                     theme::muted(ui, "Nessun altro soggetto in questa immagine");
                 }

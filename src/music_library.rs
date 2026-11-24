@@ -52,6 +52,17 @@ impl Drop for Transfer {
 }
 
 impl MusicLibrary {
+    pub fn searching(&self) -> bool {
+        self.lookup.is_some()
+    }
+
+    pub fn recommend(&mut self, ctx: &egui::Context, online: &Online, query: &str) {
+        self.open = true;
+        self.query = query.to_owned();
+        self.results.clear();
+        self.search(ctx, online);
+    }
+
     pub fn transferring(&self) -> bool {
         self.transfer.is_some()
     }

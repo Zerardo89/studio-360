@@ -232,8 +232,8 @@ l’intervallo rilevato, la velocità 1× e l’audio originale disponibile. I n
 
 ## Filmato e modelli
 
-FlashCut e le etichette dei modelli vengono dal brief. I profili sotto sono **stimati** per il montaggio
-deterministico sul PC. Il ritmo è la durata di uscita preferita per una clip.
+FlashCut e le etichette dei modelli vengono dal brief. I profili Liberi sotto sono **stimati** per il
+montaggio deterministico sul PC. Il ritmo è la durata di uscita preferita per una clip.
 
 | Modello | Ritmo | Transizioni preferite in ordine | Filtro | Velocità |
 |---|---:|---|---|---:|
@@ -253,8 +253,8 @@ La durata finale dipende dal materiale disponibile e dai secondi condivisi in tr
 finale può scostarsi fino a 0,25 s (stimati) quando il materiale basta. «Cambia modello» ricrea i tagli
 dai segmenti selezionati e conserva musica, mixer e regolazioni globali.
 
-La timeline orizzontale mostra le clip del modello. Seleziona una clip per sostituirla, eliminarla
-o regolare filtro, velocità, transizione in uscita e movimento tra la vista iniziale e quella finale.
+La timeline orizzontale mostra le clip del modello. Nei modelli Liberi puoi sostituire o eliminare una clip
+e regolarne filtro, velocità, transizione in uscita e movimento tra la vista iniziale e quella finale.
 L’anteprima condivide la timeline e il renderer dell’MP4. Usa 640 × 360 o 360 × 640 px e richieste a
 24 fps (stimati). I controlli Musica e Mixer hanno effetto sull’esportazione.
 
@@ -270,9 +270,57 @@ i 30 fps e il 4K UHD. Le altre dimensioni sono stimate. Il renderer interpola la
 filtro globale e filtro della clip e limita la sorgente al doppio del lato lungo, con un massimo
 di 4096 px (stimato). «Rendering del video… N%» avanza fino al 99% durante la codifica e raggiunge il 100%
 quando il file è stato finalizzato e salvato. Annulla interrompe il lavoro e rimuove il file incompleto.
-I segmenti già salvati di un lotto rimangono disponibili. `--auto-edit` su video crea il modello
-Dinamico prima dello screenshot. `--export-movie file.mp4` crea lo stesso modello a 720p in 16:9,
+I segmenti già salvati di un lotto rimangono disponibili. `--auto-edit` su video crea di default
+Dinamico prima dello screenshot. `--export-movie file.mp4` crea Dinamico a 720p in 16:9,
 rilegge il risultato con VideoReader e termina.
+
+## Hub dei modelli
+
+In **Modifica → Auto Edit → Modelli**, scegli una copertina e premi **Usa modello** o **Cambia modello**.
+Le categorie sono **In evidenza**, **Viaggio**, **Sport e azione**, **Vlog** e **Ritmo**. In evidenza
+riunisce Impulso urbano, Ultima luce, Giornata in viaggio e Dinamico. I modelli sono disponibili sul dispositivo.
+Un suggerimento dell’AI personale porta alla copertina corrispondente.
+
+| Modello | Categoria | Tipo | Spazi | BPM | Durata | Rapporto preferito |
+|---|---|---|---:|---:|---:|---|
+| Dinamico | Sport e azione | Libero | Variabili | 128 | Libera | 16:9 |
+| Giornata in viaggio | Viaggio | Libero | Variabili | 110 | Libera | 16:9 |
+| A tempo | Ritmo | Libero | Variabili | 120 | Libera | 16:9 |
+| Energia | Sport e azione | Libero | Variabili | 140 | Libera | 16:9 |
+| Ritmo della vita | Vlog | Libero | Variabili | 90 | Libera | 16:9 |
+| Giornata d’avventura | Viaggio | Libero | Variabili | 112 | Libera | 16:9 |
+| Battito | Ritmo | Libero | Variabili | 132 | Libera | 16:9 |
+| Avventure | Sport e azione | Libero | Variabili | 108 | Libera | 16:9 |
+| Impulso urbano | Ritmo | Sync | 6 | 120 | 15 s | 16:9 (bloccato) |
+| Cartoline in corsa | Viaggio | Sync | 5 | 100 | 12 s | 16:9 |
+| Slancio | Sport e azione | Sync | 6 | 150 | 10 s | 9:16 (bloccato) |
+| Piccole cose | Vlog | Sync | 4 | 96 | 10 s | 9:16 (bloccato) |
+| Ultima luce | Viaggio | Sync | 4 | 90 | 12 s | 16:9 (bloccato) |
+| Cronaca di strada | Vlog | Sync | 5 | 120 | 12 s | 9:16 (bloccato) |
+| Oltre la vetta | Sport e azione | Sync | 5 | 120 | 14 s | 16:9 |
+| Colpo di cassa | Ritmo | Sync | 6 | 144 | 10 s | 9:16 |
+
+Nei modelli Sync ogni spazio ha una velocità, una transizione in uscita e una durata netta espressa in
+battute. Una battuta dura `60 / BPM` secondi. La clip include anche il tratto condiviso con la clip
+successiva, così l’inizio di ogni spazio cade sulla battuta successiva prevista dal modello.
+La sequenza parte dai segmenti spuntati, ordinati per punteggio decrescente e poi per sorgente e
+tempo d’inizio. Quando finiscono, riprende la stessa graduatoria e cerca un inizio diverso nei segmenti
+riutilizzati quando c’è margine. La clip resta nell’intervallo rilevato. Una sorgente troppo breve
+accorcia lo spazio e anticipa i tagli seguenti. La timeline mostra la durata effettiva accanto a quella prevista.
+
+Seleziona uno spazio in timeline e usa **Metti nello spazio N** in **Segmenti rilevati** per sostituirlo.
+Ogni spazio è obbligatorio. La sostituzione usa la durata prevista per lo spazio, anche se la clip
+precedente era più corta. **Sincronizza al ritmo** può spostare i singoli tagli su battiti rilevati
+vicini se il materiale consente di mantenere la durata totale. I rapporti bloccati si applicano sia
+all’anteprima sia all’esportazione del filmato.
+
+**Musica consigliata** avvia la ricerca Openverse con le parole chiave del modello, quando internet
+è attivo e il progetto è senza musica. L’aggiunta di un brano richiede una scelta nella libreria.
+**Filtro del modello** sospende i filtri delle singole clip. Riattivandolo si ripristinano i valori
+precedenti di ciascuna clip.
+
+Per la schermata dimostrativa, `--panel modelli --screenshot` apre la galleria su Impulso urbano
+e applica il modello al video dopo l’analisi.
 
 ## Transizioni
 
@@ -384,6 +432,35 @@ cookie o dati dei file locali. Le richieste e le operazioni di cache girano su w
 | Dimensione di rasterizzazione del testo | 96 px (stimato) |
 | Lunghezza del testo | 160 caratteri (stimato) |
 | Attesa degli sticker nello screenshot | 12 s (stimato) |
+
+## AI personale
+
+In **Impostazioni → AI personale** si sceglie un servizio, il suo indirizzo e un modello con visione.
+L’interruttore è spento per impostazione predefinita. **Prova connessione** invia «Reply with OK»
+come richiesta di solo testo. Per Ollama e LM Studio si usa il servizio compatibile OpenAI e si può
+lasciare vuota la chiave.
+
+| Servizio | Indirizzo predefinito | Formato |
+| --- | --- | --- |
+| Compatibile OpenAI, incluso OpenRouter | `https://api.openai.com/v1` | POST `/chat/completions` con JPEG in URL dati e header `Authorization: Bearer` quando è presente una chiave |
+| Anthropic | `https://api.anthropic.com/v1` | POST `/messages` con blocchi immagine JPEG in Base64 e header `x-api-key` |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta` | POST `/models/{modello}:generateContent` con JPEG in Base64 nei dati inline e header `x-goog-api-key` |
+
+L’Auto Edit di foto e video parte dall’analisi locale. Invia al massimo le 12 miniature rettilinee
+con il punteggio locale più alto, con lato massimo di 512 px, in JPEG qualità 80. La richiesta
+contiene le miniature senza il file originale o i suoi metadati. Il timeout globale è di 90 s e
+il corpo della risposta è limitato a 2 MiB. Il modello restituisce un verdetto JSON con punteggio,
+scena e selezione delle clip, un filtro, un modello di filmato e un breve titolo in italiano.
+Le candidate che il modello non valuta conservano i risultati locali.
+
+Se l’AI è spenta, manca una configurazione valida, internet è disattivato o la richiesta fallisce,
+l’Auto Edit mostra il motivo e usa il risultato locale. Il collegamento richiede HTTPS, con HTTP
+ammesso per `localhost`, `127.0.0.1` e `[::1]`.
+
+La chiave è cifrata da Windows DPAPI per l’utente corrente in `%APPDATA%\Studio360\ai-key.bin`.
+**Rimuovi chiave** elimina il file. `settings.json` contiene solo il servizio, l’indirizzo, il
+modello e lo stato dell’interruttore per l’AI. La chiave viaggia nell’header della richiesta e
+viene oscurata nei messaggi d’errore HTTP.
 
 ## Esportazione immagini
 Risoluzioni 720P, 1080P, 2.7K, **4K** (lato lungo 1280, 1920, 2720, 3840 px): il massimo 4K è confermato dal

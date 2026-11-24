@@ -5,8 +5,10 @@ use std::{
 };
 
 use eframe::egui::{self, Color32, RichText, Stroke, StrokeKind, Ui};
+use serde::{Deserialize, Serialize};
 
 use crate::{
+    ai_provider::{self, AiClient, AiConfig, ApiKey, ProviderKind},
     app::Job,
     online::{self, Online},
     theme,
@@ -37,13 +39,16 @@ const DEVICE: &[&str] = &[
     "Ripristino di fabbrica",
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Preferences {
+    #[serde(serialize_with = "write_language", deserialize_with = "read_language")]
     language: usize,
     pub performance: bool,
     pub compatibility: bool,
     pub watermark: bool,
     pub online: bool,
+    ai: AiConfig,
 }
 
 impl Default for Preferences {
@@ -54,6 +59,7 @@ impl Default for Preferences {
             compatibility: false,
             watermark: false,
             online: true,
+            ai: AiConfig::default(),
         }
     }
 }
@@ -75,10 +81,15 @@ pub struct Settings {
     online_cache_check: Option<Instant>,
     online_cache_error: Option<String>,
     online_cleared: bool,
+    focus_ai: bool,
+    ai_key: Result<Option<ApiKey>, String>,
+    ai_key_input: String,
+    ai_test: Option<Job<Result<(), String>>>,
+    ai_notice: Option<Result<&'static str, String>>,
 }
 
 impl Settings {
-    pub fn new(read_disk: bool) -> Self {
+    pub fn new(read_disk: bool, focus_ai: bool) -> Self {
         let path = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .map(|folder| folder.join("Studio360").join("settings.json"));
@@ -92,9 +103,17 @@ impl Settings {
             online_cache_check: None,
             online_cache_error: None,
             online_cleared: false,
+            focus_ai,
+            ai_key: Ok(None),
+            ai_key_input: String::new(),
+            ai_test: None,
+            ai_notice: None,
         };
         if read_disk {
             result.load();
+            result.ai_key = result
+                .key_path()
+                .and_then(|path| ai_provider::load_key(&path));
         }
         result
     }
@@ -105,9 +124,9 @@ impl Settings {
             return;
         };
         match fs::read_to_string(path) {
-            Ok(text) => match read_preferences(&text) {
-                Some(preferences) => self.preferences = preferences,
-                None => self.error = Some(
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(preferences) => self.preferences = preferences,
+                Err(_) => self.error = Some(
                     "Il file delle impostazioni non è valido. Sono in uso i valori predefiniti."
                         .into(),
                 ),
@@ -129,14 +148,18 @@ impl Settings {
         let parent = path
             .parent()
             .ok_or("Cartella delle impostazioni non valida.")?;
-        let prefs = self.preferences;
-        let text = format!(
-            "{{\n  \"language\": \"{}\",\n  \"performance\": {},\n  \"compatibility\": {},\n  \"watermark\": {},\n  \"online\": {}\n}}\n",
-            LANGUAGES[prefs.language], prefs.performance, prefs.compatibility, prefs.watermark, prefs.online,
-        );
+        if self
+            .ai_key
+            .as_ref()
+            .is_ok_and(|key| key.as_ref().is_some_and(|key| self.key_in_config(key)))
+        {
+            return Err("Rimuovi la chiave dall’indirizzo o dal nome del modello.".into());
+        }
+        let text = serde_json::to_string_pretty(&self.preferences)
+            .map_err(|_| "Impossibile preparare le impostazioni.")?;
         let temporary = parent.join(format!("settings-{}.tmp", std::process::id()));
         let result = fs::create_dir_all(parent)
-            .and_then(|()| fs::write(&temporary, text))
+            .and_then(|()| fs::write(&temporary, text + "\n"))
             .and_then(|()| fs::rename(&temporary, path));
         if let Err(error) = result {
             let _ = fs::remove_file(temporary);
@@ -146,7 +169,7 @@ impl Settings {
     }
 
     pub fn show(&mut self, ui: &mut Ui, online: &Online) -> SettingsAction {
-        let before = self.preferences;
+        let before = self.preferences.clone();
         let mut action = SettingsAction::default();
         theme::title(
             ui,
@@ -164,11 +187,182 @@ impl Settings {
                     self.app_card(&mut columns[0], &mut action);
                     columns[0].add_space(12.0);
                     self.online_card(&mut columns[0], online);
+                    columns[0].add_space(12.0);
+                    self.ai_card(&mut columns[0]);
+                    columns[0].add_space(16.0);
                     device_card(&mut columns[1]);
                 });
             });
         action.changed = self.preferences != before;
         action
+    }
+
+    pub fn ai_for_auto_edit(&self) -> Result<AiClient, String> {
+        if !self.preferences.online {
+            return Err(ai_provider::INTERNET_DISABLED.into());
+        }
+        if !self.preferences.ai.enabled {
+            return Err("funzione disattivata nelle impostazioni".into());
+        }
+        self.ai_client()
+    }
+
+    fn ai_client(&self) -> Result<AiClient, String> {
+        let key = self.ai_key.as_ref().map_err(Clone::clone)?;
+        let client = AiClient::new(&self.preferences.ai, key.as_ref());
+        client.validate()?;
+        Ok(client)
+    }
+
+    fn key_path(&self) -> Result<PathBuf, String> {
+        self.path
+            .as_ref()
+            .map(|path| path.with_file_name("ai-key.bin"))
+            .ok_or_else(|| "Cartella APPDATA non disponibile.".into())
+    }
+
+    fn key_in_config(&self, key: &ApiKey) -> bool {
+        let config = &self.preferences.ai;
+        key.appears_in(&config.base_url) || key.appears_in(&config.model)
+    }
+
+    fn store_ai_key(&mut self) -> Result<&'static str, String> {
+        let key = ApiKey::new(&self.ai_key_input)?;
+        if self.key_in_config(&key) {
+            return Err("Rimuovi la chiave dall’indirizzo o dal nome del modello.".into());
+        }
+        ai_provider::save_key(&self.key_path()?, &key)?;
+        self.ai_key = Ok(Some(key));
+        Ok("Chiave API salvata.")
+    }
+
+    fn delete_ai_key(&mut self) -> Result<&'static str, String> {
+        ai_provider::remove_key(&self.key_path()?)?;
+        self.ai_key = Ok(None);
+        Ok("Chiave API rimossa.")
+    }
+
+    fn ai_card(&mut self, ui: &mut Ui) {
+        let online = self.preferences.online;
+        if !online {
+            self.ai_test = None;
+        }
+        if let Some(result) = Job::take(&mut self.ai_test) {
+            self.ai_notice = Some(result.map(|()| "Connessione riuscita."));
+        }
+        let testing = self.ai_test.is_some();
+        let card = theme::card(16).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            theme::heading(ui, "AI personale");
+            if !online {
+                theme::muted(ui, "Internet è disattivato. L’Auto Edit usa l’analisi locale.");
+            }
+            ui.add_enabled_ui(online && !testing, |ui| self.ai_controls(ui));
+            if testing {
+                theme::muted(ui, "Verifica della connessione…");
+            } else if let Some(result) = &self.ai_notice {
+                match result {
+                    Ok(message) => ui.colored_label(theme::OK, *message),
+                    Err(error) => ui.colored_label(theme::ERROR, error),
+                };
+            } else if let Err(error) = &self.ai_key {
+                ui.colored_label(theme::ERROR, error);
+            }
+            theme::muted(
+                ui,
+                "Le miniature delle scene scelte vengono inviate al servizio indicato. Per i server locali (Ollama, LM Studio) la chiave può restare vuota.",
+            );
+        });
+        if std::mem::take(&mut self.focus_ai) {
+            card.response.scroll_to_me_animation(
+                Some(egui::Align::BOTTOM),
+                egui::style::ScrollAnimation::none(),
+            );
+        }
+    }
+
+    fn ai_controls(&mut self, ui: &mut Ui) {
+        let config = &mut self.preferences.ai;
+        ui.checkbox(&mut config.enabled, "Usa la mia AI per l’Auto Edit");
+        let mut provider = config.kind as usize;
+        let service = ui.label("Servizio");
+        let combo = egui::ComboBox::from_id_salt("ai_provider")
+            .selected_text(ProviderKind::LABELS[provider])
+            .width(ui.available_width())
+            .wrap()
+            .show_ui(ui, |ui| {
+                for (index, label) in ProviderKind::LABELS.iter().enumerate() {
+                    ui.selectable_value(&mut provider, index, *label);
+                }
+            });
+        combo.response.labelled_by(service.id);
+        let kind = ProviderKind::ALL[provider];
+        if kind != config.kind {
+            if config.base_url.trim().trim_end_matches('/') == config.kind.default_url() {
+                config.base_url = kind.default_url().into();
+            }
+            config.kind = kind;
+            self.ai_notice = None;
+        }
+        let address_changed = text_field(ui, "Indirizzo", &mut config.base_url).changed();
+        let model_changed = text_field(ui, "Modello", &mut config.model).changed();
+        if address_changed || model_changed {
+            self.ai_notice = None;
+        }
+        let label = ui.label("Chiave API");
+        let key_input = ui
+            .add(
+                egui::TextEdit::singleline(&mut self.ai_key_input)
+                    .desired_width(f32::INFINITY)
+                    .char_limit(4096)
+                    .password(true),
+            )
+            .labelled_by(label.id);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !self.ai_key_input.trim().is_empty(),
+                    egui::Button::new("Salva chiave"),
+                )
+                .clicked()
+            {
+                let saved = self.store_ai_key();
+                if saved.is_ok() {
+                    clear_key_input(ui.ctx(), key_input.id, &mut self.ai_key_input);
+                }
+                self.ai_notice = Some(saved);
+            }
+            if ui
+                .add_enabled(
+                    !matches!(self.ai_key, Ok(None)),
+                    egui::Button::new("Rimuovi chiave"),
+                )
+                .clicked()
+            {
+                let removed = self.delete_ai_key();
+                if removed.is_ok() {
+                    clear_key_input(ui.ctx(), key_input.id, &mut self.ai_key_input);
+                }
+                self.ai_notice = Some(removed);
+            }
+            theme::muted(
+                ui,
+                if matches!(self.ai_key, Ok(Some(_))) {
+                    "Chiave salvata"
+                } else {
+                    "Nessuna chiave"
+                },
+            );
+        });
+        if ui.button("Prova connessione").clicked() {
+            self.ai_notice = None;
+            match self.ai_client() {
+                Ok(client) => {
+                    self.ai_test = Some(Job::start(ui.ctx(), move || client.test_connection()))
+                }
+                Err(error) => self.ai_notice = Some(Err(error)),
+            }
+        }
     }
 
     fn online_card(&mut self, ui: &mut Ui, online: &Online) {
@@ -199,7 +393,7 @@ impl Settings {
             theme::heading(ui, "Contenuti online");
             ui.checkbox(
                 &mut self.preferences.online,
-                "Usa internet per musiche ed emoji",
+                "Usa internet per musiche, emoji e AI personale",
             );
             if let Some(bytes) = self.online_cache_size {
                 theme::muted(
@@ -291,6 +485,20 @@ impl Settings {
     }
 }
 
+fn text_field(ui: &mut Ui, label: &str, text: &mut String) -> egui::Response {
+    let label = ui.label(label);
+    ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY))
+        .labelled_by(label.id)
+}
+
+fn clear_key_input(ctx: &egui::Context, id: egui::Id, text: &mut String) {
+    *text = String::new();
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        state.clear_undoer();
+        egui::TextEdit::store_state(ctx, id, state);
+    }
+}
+
 fn row(ui: &mut Ui, label: &str, content: impl FnOnce(&mut Ui)) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -369,25 +577,37 @@ fn toggle(ui: &mut Ui, label: &str, value: &mut bool) {
     });
 }
 
-// This file uses a fixed schema written by the application. Each field is a known
-// language name or a JSON boolean.
-fn read_preferences(text: &str) -> Option<Preferences> {
-    let fields = text.trim().strip_prefix('{')?.strip_suffix('}')?;
-    let mut result = Preferences::default();
-    for pair in fields.split(',').filter(|part| !part.trim().is_empty()) {
-        let (key, value) = pair.split_once(':')?;
-        let value = value.trim();
-        match key.trim() {
-            "\"language\"" => {
-                let language = value.strip_prefix('"')?.strip_suffix('"')?;
-                result.language = LANGUAGES.iter().position(|&name| name == language)?;
-            }
-            "\"performance\"" => result.performance = value.parse().ok()?,
-            "\"compatibility\"" => result.compatibility = value.parse().ok()?,
-            "\"watermark\"" => result.watermark = value.parse().ok()?,
-            "\"online\"" => result.online = value.parse().ok()?,
-            _ => {}
-        }
+fn write_language<S: serde::Serializer>(
+    language: &usize,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(LANGUAGES[*language])
+}
+
+fn read_language<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<usize, D::Error> {
+    let language = String::deserialize(deserializer)?;
+    LANGUAGES
+        .iter()
+        .position(|&name| name == language)
+        .ok_or_else(|| serde::de::Error::custom("Lingua delle impostazioni non valida."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_keep_old_defaults_and_round_trip_ai_without_key() {
+        let mut preferences: Preferences =
+            serde_json::from_str(r#"{"language":"Italiano","performance":true,"online":false}"#)
+                .unwrap();
+        assert!(preferences.performance);
+        assert!(!preferences.online);
+        assert!(preferences.ai == AiConfig::default());
+        preferences.ai.enabled = true;
+        preferences.ai.model = "visione: \"uno,due\"".into();
+        let json = serde_json::to_value(&preferences).unwrap();
+        assert_eq!(json["ai"].as_object().unwrap().len(), 4);
+        assert!(serde_json::from_value::<Preferences>(json).unwrap() == preferences);
     }
-    Some(result)
 }

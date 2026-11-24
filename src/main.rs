@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod ai_provider;
 mod album;
 mod app;
 mod autoedit;
@@ -22,6 +23,8 @@ mod overlay_tests;
 mod panorama;
 mod playback;
 mod settings;
+mod template_hub;
+mod templates;
 mod theme;
 mod video;
 
@@ -36,7 +39,7 @@ use editor::InitialPanel;
 use eframe::egui;
 
 const USAGE: &str =
-    "studio360 [--tab <home|album|scatto|modifica|impostazioni>] [--open <file>] [--auto-edit] [--panel <musica|sticker|testo>] [--screenshot <file.png>] [--export-movie <file.mp4>]\n\
+    "studio360 [--tab <home|album|scatto|modifica|impostazioni>] [--open <file>] [--auto-edit] [--panel <musica|sticker|testo|modelli>] [--screenshot <file.png>] [--export-movie <file.mp4>]\n\
      --open carica il file in Modifica, che diventa la scheda iniziale se manca --tab.\n\
      --auto-edit avvia l’analisi in Modifica e crea il primo modello per i video.\n\
      --panel apre un pannello di Modifica.\n\

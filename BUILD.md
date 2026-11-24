@@ -8,6 +8,7 @@ I contenuti online usano `ureq` 3 con le feature `native-tls` e `json`. Le conne
 usano SChannel e l’archivio dei certificati di Windows. Il catalogo usa `serde` e `serde_json`,
 mentre le query usano `percent-encoding`. `ab_glyph` 0.2 rasterizza il testo dai byte di
 `epaint_default_fonts` 0.37. La feature Windows `Win32_Media_Audio` abilita l’anteprima WASAPI.
+Le feature `Win32_Foundation` e `Win32_Security_Cryptography` abilitano il salvataggio della chiave AI con DPAPI.
 Alla prima build Cargo deve poter scaricare le nuove dipendenze oppure trovarle nella cache locale.
 Per compilare sul target Windows GNU non serve un compilatore C.
 

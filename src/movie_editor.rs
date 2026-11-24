@@ -11,23 +11,30 @@ use eframe::egui::{self, Rect, RichText, Stroke, StrokeKind, Ui};
 use image::RgbaImage;
 
 use crate::{
+    ai_provider::{self, AiAnalysis, AnalysisSource, Thumbnail},
     app::Job,
-    autoedit::{Segment, NO_VIDEO_SUBJECT, THUMBNAIL_SIZE},
+    autoedit::{self, Segment, NO_VIDEO_SUBJECT, THUMBNAIL_SIZE},
     movie::{
-        self, Curve, Movie, MovieRenderer, Music, OutputProfile, Speed, TargetDuration, Template,
-        Transition, ASPECTS, MAX_PLAYBACK_SPEED, MIN_PLAYBACK_SPEED, RESOLUTIONS,
+        self, Curve, Filter, Movie, MovieRenderer, Music, OutputProfile, Speed, TargetDuration,
+        Template, Transition, ASPECTS, MAX_PLAYBACK_SPEED, MIN_PLAYBACK_SPEED, RESOLUTIONS,
     },
     music_library::MusicLibrary,
     online::Online,
     overlay::Overlays,
     panorama::{Adjust, View, ADJUST_NAMES},
     playback::{self, format_time},
+    settings::Settings,
+    template_hub::Hub,
+    templates::TemplateKind,
     theme, video,
 };
 
 const PREVIEW_SIZES: [(u32, u32); 2] = [(640, 360), (360, 640)];
 const PREVIEW_FPS: f64 = 24.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(32);
+const FIXED_DURATION: &str = "Il modello non supporta la regolazione della durata";
+const FIXED_ASPECT: &str = "Il modello non supporta la regolazione del rapporto.";
+const REQUIRED_SLOT: &str = "Questo spazio è necessario in questo modello";
 const FILTER_LABELS: &[&str] = &[
     "Nessuno",
     "Cinema",
@@ -49,6 +56,11 @@ struct Found {
     segment: Segment,
     selected: bool,
     texture: Option<egui::TextureHandle>,
+}
+
+struct AnalyzedSegments {
+    segments: Vec<Segment>,
+    ai: AiAnalysis,
 }
 
 enum TaskResult {
@@ -188,15 +200,17 @@ impl MoviePreview {
 
 pub struct MovieEditor {
     source: PathBuf,
-    analysis: Option<Job<Result<Vec<Segment>, String>>>,
+    analysis: Option<Job<Result<AnalyzedSegments, String>>>,
     analysis_cancel: Arc<AtomicBool>,
     progress: Arc<AtomicU8>,
     analyzed: bool,
+    analysis_source: Option<AnalysisSource>,
     auto_create: bool,
     found: Vec<Found>,
     movie: Option<Movie>,
     selected: usize,
-    template: usize,
+    hub: Hub,
+    suggested_filter: Option<Filter>,
     target: usize,
     output: OutputProfile,
     music: Option<Music>,
@@ -228,12 +242,14 @@ impl MovieEditor {
             analysis: None,
             progress: Arc::new(AtomicU8::new(0)),
             analyzed: false,
+            analysis_source: None,
             analysis_cancel: Arc::new(AtomicBool::new(false)),
             auto_create: false,
             found: Vec::new(),
             movie: None,
             selected: 0,
-            template: 0,
+            hub: Hub::default(),
+            suggested_filter: None,
             target: 0,
             output: OutputProfile {
                 resolution: 1,
@@ -256,24 +272,53 @@ impl MovieEditor {
         }
     }
 
-    pub fn analyze(&mut self, ctx: &egui::Context, auto_create: bool) {
+    pub fn analyze(
+        &mut self,
+        ctx: &egui::Context,
+        auto_create: bool,
+        settings: &Settings,
+        online: &Online,
+    ) {
         self.auto_create |= auto_create;
         if self.analysis.is_some() || self.analyzed {
             return;
         }
-        self.progress.store(0, Ordering::Relaxed);
+        self.progress = Arc::new(AtomicU8::new(0));
         self.notice = None;
         let source = self.source.clone();
         let progress = Arc::clone(&self.progress);
+        self.analysis_cancel = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::clone(&self.analysis_cancel);
+        let client = settings.ai_for_auto_edit();
+        let has_ai = client.is_ok();
+        let online = online.clone();
         self.analysis = Some(Job::start(ctx, move || {
-            movie::analyze_source(
+            let cancelled = || cancelled.load(Ordering::Relaxed);
+            let segments = movie::analyze_source(
                 &source,
                 |percent| {
-                    progress.store(percent, Ordering::Relaxed);
+                    progress.store(
+                        ai_provider::local_progress(percent, has_ai),
+                        Ordering::Relaxed,
+                    );
                 },
-                || cancelled.load(Ordering::Relaxed),
-            )
+                cancelled,
+            )?;
+            if cancelled() {
+                return Err("Analisi video annullata.".into());
+            }
+            let candidates: Vec<_> = segments
+                .iter()
+                .map(|segment| Thumbnail {
+                    score: segment.score,
+                    rgb: &segment.thumbnail,
+                    size: THUMBNAIL_SIZE,
+                })
+                .collect();
+            let ai = ai_provider::analyze(client, &candidates, online.enabled(), |phase| {
+                progress.store(phase, Ordering::Relaxed);
+            });
+            Ok(AnalyzedSegments { segments, ai })
         }));
     }
 
@@ -313,6 +358,13 @@ impl MovieEditor {
         self.music_library.open = true;
     }
 
+    pub fn open_template_hub(&mut self, demo: bool) {
+        self.hub.scroll_to_heading = true;
+        if demo {
+            self.hub.select(Template::UrbanPulse);
+        }
+    }
+
     fn invalidate(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.preview_error = None;
@@ -324,20 +376,23 @@ impl MovieEditor {
         self.invalidate();
     }
 
-    fn create(&mut self, ctx: &egui::Context, color: Adjust) {
-        let (indices, segments): (Vec<_>, Vec<_>) = self
-            .found
+    fn selected_segments(&self) -> (Vec<usize>, Vec<Segment>) {
+        self.found
             .iter()
             .enumerate()
             .filter(|(_, found)| found.selected)
             .map(|(i, found)| (i, found.segment.clone()))
-            .unzip();
+            .unzip()
+    }
+
+    fn create(&mut self, ctx: &egui::Context, color: Adjust) {
+        let (indices, segments) = self.selected_segments();
         if segments.is_empty() {
             return;
         }
         let mut movie = movie::build_from_template(
             &segments,
-            Template::ALL[self.template],
+            self.hub.selected,
             TargetDuration::ALL[self.target],
         );
         for clip in &mut movie.clips {
@@ -349,6 +404,8 @@ impl MovieEditor {
             movie.original_audio_volume = previous.original_audio_volume;
             movie.music_volume = previous.music_volume;
             movie.filter = previous.filter;
+        } else if let Some(filter) = self.suggested_filter {
+            movie.filter = filter;
         }
         movie.music = self.music.clone();
         movie.overlays = self.overlays.clone();
@@ -373,8 +430,9 @@ impl MovieEditor {
         let analyzing = self.analysis.is_some();
         if let Some(result) = Job::take(&mut self.analysis) {
             match result {
-                Ok(segments) => {
+                Ok(AnalyzedSegments { segments, ai }) => {
                     self.analyzed = true;
+                    self.analysis_source = Some(ai.source);
                     self.found = segments
                         .into_iter()
                         .enumerate()
@@ -398,6 +456,20 @@ impl MovieEditor {
                             }
                         })
                         .collect();
+                    if let Some(verdict) = ai.verdict {
+                        for change in verdict.clips {
+                            let found = &mut self.found[change.index];
+                            change.apply(
+                                &mut found.segment.score,
+                                &mut found.segment.scene,
+                                &mut found.selected,
+                            );
+                        }
+                        if let Some(template) = verdict.template {
+                            self.hub.select(template);
+                        }
+                        self.suggested_filter = verdict.filter;
+                    }
                     if self.auto_create {
                         self.create(ctx, color);
                     }
@@ -467,11 +539,24 @@ impl MovieEditor {
             .is_some_and(|movie| !movie.clips.is_empty())
     }
     pub fn aspect(&self) -> f32 {
-        let (w, h) = PREVIEW_SIZES[self.output.aspect];
+        let (w, h) = PREVIEW_SIZES[self.movie_output().aspect];
         w as f32 / h as f32
     }
 
+    fn locked_aspect(&self) -> Option<usize> {
+        let info = self.movie.as_ref()?.template.info();
+        info.aspect_locked.then_some(info.aspect)
+    }
+
+    fn movie_output(&self) -> OutputProfile {
+        OutputProfile {
+            aspect: self.locked_aspect().unwrap_or(self.output.aspect),
+            ..self.output
+        }
+    }
+
     pub fn paint_preview(&mut self, ui: &Ui, rect: Rect) {
+        let aspect = self.movie_output().aspect;
         if let Some(movie) = &self.movie {
             let length = movie.duration();
             self.position = self.position.min(length);
@@ -487,9 +572,7 @@ impl MovieEditor {
                 let preview = self
                     .preview
                     .get_or_insert_with(|| MoviePreview::new(ui.ctx()));
-                if let Err(error) =
-                    preview.update(ui.ctx(), movie, self.revision, time, self.output.aspect)
-                {
+                if let Err(error) = preview.update(ui.ctx(), movie, self.revision, time, aspect) {
                     self.preview_error = Some(error);
                     self.clock = None;
                 }
@@ -528,6 +611,10 @@ impl MovieEditor {
             return false;
         };
         let timeline = movie.timeline();
+        let shortened: Vec<_> = movie
+            .shortened_slots()
+            .map(|i| (i + 1).to_string())
+            .collect();
         let mut open_export = false;
         let mut seek = None;
         let was_preview = self.showing_preview;
@@ -548,6 +635,13 @@ impl MovieEditor {
                 }
                 if ui.button("Esporta filmato").clicked() {
                     open_export = true;
+                }
+                if !shortened.is_empty() {
+                    ui.colored_label(theme::ERROR, "Spazi accorciati")
+                        .on_hover_text(format!(
+                            "Sorgente troppo breve negli spazi {}.",
+                            shortened.join(", ")
+                        ));
                 }
             });
             if self.showing_preview {
@@ -597,7 +691,18 @@ impl MovieEditor {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         for (i, clip) in movie.clips.iter().enumerate() {
-                            let title = format!("Clip {} · {:.1} s", i + 1, clip.duration());
+                            let title = if let Some(expected) = movie.slot_duration(i) {
+                                let end =
+                                    timeline.starts.get(i + 1).copied().unwrap_or(timeline.end);
+                                let actual = end - timeline.starts[i];
+                                if actual < expected - 0.001 {
+                                    format!("Spazio {} · {:.1}/{:.1} s", i + 1, actual, expected)
+                                } else {
+                                    format!("Spazio {} · {:.1} s", i + 1, expected)
+                                }
+                            } else {
+                                format!("Clip {} · {:.1} s", i + 1, clip.duration())
+                            };
                             let texture = self
                                 .found
                                 .get(clip.segment_index)
@@ -713,7 +818,7 @@ impl MovieEditor {
         let Some(movie) = self.movie.clone() else {
             return;
         };
-        let output = self.output;
+        let output = self.movie_output();
         self.start_task(ctx, TaskKind::Export, move |progress, cancel| {
             let Some(path) = save_as(
                 "Esporta filmato",
@@ -842,7 +947,11 @@ impl MovieEditor {
                 TaskKind::ExtractMusic => theme::muted(ui, "Estrazione della musica…"),
             }
         }
-        if let Some((message, failed)) = &self.notice {
+        if let Some((message, failed)) = self
+            .notice
+            .as_ref()
+            .filter(|(message, _)| message != REQUIRED_SLOT)
+        {
             ui.colored_label(if *failed { theme::ERROR } else { theme::TEXT }, message);
         }
         for warning in &self.warnings {
@@ -856,61 +965,128 @@ impl MovieEditor {
         color: Adjust,
         watermark: bool,
         spherical: bool,
+        settings: &Settings,
         online: &Online,
     ) {
         self.status(ui);
         if self.analysis.is_some() {
-            let percent = self.progress.load(Ordering::Relaxed);
-            ui.add(
-                egui::ProgressBar::new(f32::from(percent) / 100.0)
-                    .text(format!("Analisi del video… {percent}%")),
+            let (fraction, label) = ai_provider::progress_display(
+                self.progress.load(Ordering::Relaxed),
+                "Analisi del video…",
             );
+            ui.add(egui::ProgressBar::new(fraction).text(label));
+            if ui.button("Annulla analisi").clicked() {
+                self.analysis_cancel.store(true, Ordering::Relaxed);
+                self.analysis = None;
+                self.auto_create = false;
+                self.notice = Some(("Analisi video annullata.".into(), false));
+            }
             return;
         }
         if !self.analyzed {
             if ui.button("Riprova analisi").clicked() {
-                self.analyze(ui.ctx(), false);
+                self.analyze(ui.ctx(), false, settings, online);
             }
             return;
+        }
+        if let Some(source) = &self.analysis_source {
+            autoedit::show_analysis_source(ui, source);
         }
         if self.found.is_empty() {
             ui.label(NO_VIDEO_SUBJECT);
             return;
         }
         ui.add_enabled_ui(self.task.is_none(), |ui| {
-            theme::heading(ui, "Crea filmato con un tocco");
-            let any = self.found.iter().any(|found| found.selected);
-            combo_row(
+            let target = TargetDuration::ALL[self.target];
+            let (_, segments) = self.selected_segments();
+            let active = self.movie.as_ref().map(|movie| movie.template);
+            self.hub.show(
                 ui,
-                "Modello",
-                "modello",
-                &mut self.template,
-                Template::LABELS,
+                active,
+                &segments,
+                target,
+                !settings.preferences.performance && !settings.preferences.compatibility,
             );
-            combo_row(
-                ui,
-                "Durata",
-                "durata_obiettivo",
-                &mut self.target,
-                TargetDuration::LABELS,
-            );
+            let info = self.hub.selected.info();
+            ui.label(info.description);
+            theme::muted(ui, format!("{} BPM · {}", info.bpm, ASPECTS[info.aspect]));
+            match info.kind {
+                TemplateKind::Free => {
+                    combo_row(
+                        ui,
+                        "Durata",
+                        "durata_obiettivo",
+                        &mut self.target,
+                        TargetDuration::LABELS,
+                    );
+                }
+                TemplateKind::Sync { seconds, .. } => {
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(format!("Durata · {}", format_time(seconds))),
+                    )
+                    .on_disabled_hover_text(FIXED_DURATION);
+                    theme::muted(ui, FIXED_DURATION);
+                }
+            }
             let label = if self.movie.is_some() {
                 "Cambia modello"
             } else {
-                "Crea"
+                "Usa modello"
             };
-            if ui.add_enabled(any, theme::primary(label)).clicked() {
+            if ui
+                .add_enabled(!segments.is_empty(), theme::primary(label))
+                .clicked()
+            {
                 self.create(ui.ctx(), color);
+            }
+            self.template_filter(ui);
+            let recommend_music = self.music.is_none()
+                && ui
+                    .add_enabled(
+                        online.enabled()
+                            && !self.music_library.searching()
+                            && !self.music_library.transferring(),
+                        egui::Button::new("Musica consigliata"),
+                    )
+                    .on_disabled_hover_text(if online.enabled() {
+                        "Attendi il completamento dell’operazione in corso."
+                    } else {
+                        "Attiva internet nelle impostazioni per cercare musica."
+                    })
+                    .clicked();
+            if recommend_music {
+                self.music_library
+                    .recommend(ui.ctx(), online, info.music_query);
             }
             ui.separator();
             egui::CollapsingHeader::new(format!("Segmenti rilevati ({})", self.found.len()))
                 .id_salt("segmenti_rilevati")
                 .default_open(true)
                 .show(ui, |ui| self.segments(ui));
-            ui.collapsing("Musica", |ui| self.music_controls(ui, online));
+            let music = egui::CollapsingHeader::new("Musica")
+                .open(recommend_music.then_some(true))
+                .show(ui, |ui| self.music_controls(ui, online));
+            if recommend_music {
+                music.header_response.scroll_to_me(Some(egui::Align::TOP));
+            }
             self.clip_controls(ui, spherical);
             self.export_controls(ui, color, watermark);
         });
+    }
+
+    fn template_filter(&mut self, ui: &mut Ui) {
+        let Some(movie) = self.movie.as_mut().filter(|movie| !movie.clips.is_empty()) else {
+            return;
+        };
+        let mut enabled = movie.template_filter_enabled();
+        if ui.checkbox(&mut enabled, "Filtro del modello").changed() {
+            movie.set_template_filter(enabled);
+            self.invalidate();
+        }
+        if !enabled {
+            theme::muted(ui, "Rimosso il filtro del modello da tutte le clip");
+        }
     }
 
     pub fn show_export(&mut self, ui: &mut Ui, color: Adjust, watermark: bool) {
@@ -934,7 +1110,12 @@ impl MovieEditor {
             &mut self.output.resolution,
             &RESOLUTIONS,
         );
-        if combo_row(
+        if let Some(mut aspect) = self.locked_aspect() {
+            ui.add_enabled_ui(false, |ui| {
+                combo_row(ui, "Formato", "formato_filmato", &mut aspect, &ASPECTS);
+            });
+            theme::muted(ui, FIXED_ASPECT);
+        } else if combo_row(
             ui,
             "Formato",
             "formato_filmato",
@@ -962,6 +1143,12 @@ impl MovieEditor {
     }
 
     fn segments(&mut self, ui: &mut Ui) {
+        let slot = self
+            .movie
+            .as_ref()
+            .and_then(|movie| movie.slot_duration(self.selected))
+            .map(|_| self.selected + 1);
+        let mut replace = None;
         egui::ScrollArea::vertical()
             .id_salt("elenco_segmenti")
             .max_height(170.0)
@@ -1006,9 +1193,28 @@ impl MovieEditor {
                                 );
                             });
                         });
+                        if let Some(slot) = slot {
+                            if ui.button(format!("Metti nello spazio {slot}")).clicked() {
+                                replace = Some(i);
+                            }
+                        }
                     });
                 }
             });
+        if let Some(index) = replace {
+            self.replace_clip(index);
+        }
+    }
+
+    fn replace_clip(&mut self, index: usize) {
+        if let Some(movie) = &mut self.movie {
+            movie.replace(self.selected, &self.found[index].segment, index);
+            if movie.slot_duration(self.selected).is_some() {
+                self.position = movie.timeline().starts[self.selected];
+                self.notice = None;
+            }
+            self.edited();
+        }
     }
 
     pub fn show_music(&mut self, ui: &mut Ui, online: &Online) {
@@ -1126,6 +1332,8 @@ impl MovieEditor {
 
     fn clip_controls(&mut self, ui: &mut Ui, spherical: bool) {
         let Some(movie) = &mut self.movie else { return };
+        let sync = matches!(movie.template.info().kind, TemplateKind::Sync { .. });
+        let filter_enabled = movie.template_filter_enabled();
         let mut edited = false;
         let mut replace = None;
         let mut delete = false;
@@ -1136,8 +1344,9 @@ impl MovieEditor {
                 theme::muted(ui, "Crea un filmato per aggiungere clip.");
                 return;
             };
+            let label = if sync { "Spazio" } else { "Clip" };
             ui.label(format!(
-                "Clip {} · {:.2} s",
+                "{label} {} · {:.2} s",
                 self.selected + 1,
                 clip.duration()
             ));
@@ -1162,40 +1371,63 @@ impl MovieEditor {
                         ui.label("Nessun altro segmento");
                     }
                 });
-                delete = ui.button("Elimina").clicked();
+                if ui.button("Elimina").clicked() {
+                    if sync {
+                        self.notice = Some((REQUIRED_SLOT.into(), false));
+                    } else {
+                        delete = true;
+                    }
+                }
             });
-            edited |= combo_row(
-                ui,
-                "Filtro clip",
-                "filtro_clip",
-                &mut clip.filter.0,
-                FILTER_LABELS,
-            );
-            let mut transition = clip.transition_out as usize;
-            ui.add_enabled_ui(has_next, |ui| {
-                if combo_row(
+            if sync
+                && self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|(text, _)| text == REQUIRED_SLOT)
+            {
+                theme::muted(ui, REQUIRED_SLOT);
+            }
+            ui.add_enabled_ui(filter_enabled, |ui| {
+                edited |= combo_row(
                     ui,
-                    "Transizione in uscita",
-                    "transizione",
-                    &mut transition,
-                    Transition::LABELS,
-                ) {
-                    clip.transition_out = Transition::ALL[transition];
-                    edited = true;
-                }
-            })
-            .response
-            .on_disabled_hover_text(format!(
-                "{}. Serve una clip successiva.",
-                clip.transition_out.label()
-            ));
-            ui.collapsing("Velocità", |ui| {
-                edited |= speed_controls(ui, clip);
-                if ui.button("Applica a tutte le clip").clicked() {
-                    all_speed = Some(clip.speed);
-                    edited = true;
-                }
+                    "Filtro clip",
+                    "filtro_clip",
+                    &mut clip.filter.0,
+                    FILTER_LABELS,
+                );
             });
+            if sync {
+                theme::muted(ui, format!("Velocità del modello · {}×", clip.speed.rate()));
+                if has_next {
+                    theme::muted(ui, format!("Transizione · {}", clip.transition_out.label()));
+                }
+            } else {
+                let mut transition = clip.transition_out as usize;
+                ui.add_enabled_ui(has_next, |ui| {
+                    if combo_row(
+                        ui,
+                        "Transizione in uscita",
+                        "transizione",
+                        &mut transition,
+                        Transition::LABELS,
+                    ) {
+                        clip.transition_out = Transition::ALL[transition];
+                        edited = true;
+                    }
+                })
+                .response
+                .on_disabled_hover_text(format!(
+                    "{}. Serve una clip successiva.",
+                    clip.transition_out.label()
+                ));
+                ui.collapsing("Velocità", |ui| {
+                    edited |= speed_controls(ui, clip);
+                    if ui.button("Applica a tutte le clip").clicked() {
+                        all_speed = Some(clip.speed);
+                        edited = true;
+                    }
+                });
+            }
             ui.add_enabled_ui(spherical, |ui| {
                 ui.collapsing("Movimento", |ui| {
                     ui.label("Vista iniziale");
@@ -1205,10 +1437,6 @@ impl MovieEditor {
                 });
             });
         });
-        if let Some(i) = replace {
-            movie.replace(self.selected, &self.found[i].segment, i);
-            edited = true;
-        }
         if delete && self.selected < movie.clips.len() {
             movie.clips.remove(self.selected);
             self.selected = self.selected.min(movie.clips.len().saturating_sub(1));
@@ -1247,11 +1475,11 @@ impl MovieEditor {
             });
         });
         ui.collapsing("Statistiche", |ui| {
-            ui.label(format!(
-                "{} · Obiettivo {}",
-                movie.template.label(),
-                movie.target_duration.label()
-            ));
+            let duration = match movie.template.info().kind {
+                TemplateKind::Free => format!("Obiettivo {}", movie.target_duration.label()),
+                TemplateKind::Sync { seconds, .. } => format!("Sync · {}", format_time(seconds)),
+            };
+            ui.label(format!("{} · {duration}", movie.template.label()));
             ui.label(format!(
                 "{} clip · {:.2} s · {} fps",
                 movie.clips.len(),
@@ -1259,7 +1487,9 @@ impl MovieEditor {
                 movie::FPS
             ));
         });
-        if edited {
+        if let Some(index) = replace {
+            self.replace_clip(index);
+        } else if edited {
             self.edited();
         }
     }

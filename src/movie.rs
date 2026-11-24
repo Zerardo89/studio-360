@@ -14,6 +14,7 @@ use crate::{
     overlay::{self, Overlays},
     panorama::{self, preset, Adjust, Pano, Region, View},
     playback::{self, PanoramaVideo},
+    templates::{Slot, TemplateKind},
     video::{self, AudioReader, PendingOutput, VideoWriter, AUDIO_BLOCK, AUDIO_HZ},
 };
 
@@ -80,6 +81,10 @@ choices!(Template {
     Dynamic => "Dinamico", TravelingDay => "Giornata in viaggio", InSync => "A tempo",
     Energy => "Energia", RhythmOfLife => "Ritmo della vita", AdventureDay => "Giornata d’avventura",
     Pulse => "Battito", Adventures => "Avventure",
+    UrbanPulse => "Impulso urbano", Postcards => "Cartoline in corsa",
+    Momentum => "Slancio", LittleThings => "Piccole cose", LastLight => "Ultima luce",
+    StreetJournal => "Cronaca di strada", BeyondThePeak => "Oltre la vetta",
+    KickDrum => "Colpo di cassa",
 });
 
 choices!(TargetDuration {
@@ -156,6 +161,15 @@ pub struct Clip {
     pub filter: Filter,
     pub segment_index: usize,
     limit_end: f64,
+    slot_source: Option<SlotSource>,
+    saved_filter: Option<Filter>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SlotSource {
+    start: f64,
+    start_view: View,
+    end_view: View,
 }
 
 impl Clip {
@@ -165,18 +179,71 @@ impl Clip {
         profile: &TemplateProfile,
         position: usize,
     ) -> Self {
+        let mut clip = Self::source_clip(segment, index);
+        clip.speed = Speed::Constant(profile.speed);
+        clip.transition_out = profile.transitions[position % profile.transitions.len()];
+        clip.filter = profile.filter;
+        clip
+    }
+
+    fn source_clip(segment: &Segment, index: usize) -> Self {
         Self {
             source: segment.source.clone(),
             start: segment.start,
             end: segment.end,
             view: segment.start_view,
             end_view: segment.end_view,
-            speed: Speed::Constant(profile.speed),
-            transition_out: profile.transitions[position % profile.transitions.len()],
-            filter: profile.filter,
+            speed: Speed::Constant(1.0),
+            transition_out: Transition::None,
+            filter: Filter(0),
             segment_index: index,
             limit_end: segment.end,
+            slot_source: None,
+            saved_filter: None,
         }
+    }
+
+    fn from_slot(segment: &Segment, index: usize, slot: Slot, filter: Filter) -> Self {
+        let mut clip = Self::source_clip(segment, index);
+        clip.speed = Speed::Constant(slot.speed);
+        clip.transition_out = slot.transition;
+        clip.filter = filter;
+        clip.slot_source = Some(SlotSource {
+            start: segment.start,
+            start_view: segment.start_view,
+            end_view: segment.end_view,
+        });
+        clip
+    }
+
+    fn set_slot_span(&mut self, preferred_start: f64, span: f64) {
+        let source = self.slot_source.expect("Sync clip has a source interval");
+        let length = self.limit_end - source.start;
+        let latest_start = (self.limit_end - span).max(source.start);
+        let start = preferred_start.clamp(source.start, latest_start);
+        let end = (start + span).min(self.limit_end);
+        let view_at = |time: f64| {
+            if time == source.start {
+                return source.start_view;
+            }
+            if time == self.limit_end {
+                return source.end_view;
+            }
+            panorama::interpolate_view(
+                source.start_view,
+                source.end_view,
+                ((time - source.start) / length) as f32,
+            )
+        };
+        // Preserve manual reframing while updating the automatically interpolated views.
+        if self.view == view_at(self.start) {
+            self.view = view_at(start);
+        }
+        if self.end_view == view_at(self.end) {
+            self.end_view = view_at(end);
+        }
+        self.start = start;
+        self.end = end;
     }
 
     pub fn duration(&self) -> f64 {
@@ -203,6 +270,7 @@ pub struct Movie {
     pub filter: Filter,
     pub colore: Adjust,
     pub overlays: Overlays,
+    slot_lengths: Vec<f64>,
 }
 
 struct TemplateProfile {
@@ -275,20 +343,98 @@ fn overlap(a: &Clip, b: &Clip) -> f64 {
     TRANSITION_SECONDS.min(MAX_OVERLAP_FRACTION * a.duration().min(b.duration()))
 }
 
+fn valid_segment(segment: &Segment) -> bool {
+    segment.start.is_finite()
+        && segment.end.is_finite()
+        && segment.start >= 0.0
+        && segment.end > segment.start
+}
+
+pub fn build_from_slots(segments: &[Segment], template: Template) -> Movie {
+    let info = template.info();
+    let TemplateKind::Sync { slots, filter, .. } = info.kind else {
+        return build_free(segments, template, TargetDuration::UpTo30);
+    };
+    let mut order: Vec<_> = (0..segments.len())
+        .filter(|&i| valid_segment(&segments[i]))
+        .collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&segments[a], &segments[b]);
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.source.cmp(&b.source))
+            .then_with(|| a.start.total_cmp(&b.start))
+    });
+    let clips = slots
+        .iter()
+        .zip(order.into_iter().cycle())
+        .map(|(&slot, index)| Clip::from_slot(&segments[index], index, slot, filter))
+        .collect();
+    let mut movie = Movie::with_clips(clips, template, TargetDuration::UpTo30);
+    movie.slot_lengths = slots.iter().map(|slot| slot.seconds(info.bpm)).collect();
+    fit_slots(&mut movie.clips, &movie.slot_lengths);
+
+    // Spread repeated takes across the available interval, favoring the largest
+    // distance from an already chosen start for the same highlight.
+    let mut used_starts = HashMap::<usize, Vec<f64>>::new();
+    for clip in &mut movie.clips {
+        let starts = used_starts.entry(clip.segment_index).or_default();
+        let span = clip.end - clip.start;
+        let latest = (clip.limit_end - span).max(clip.start);
+        if !starts.is_empty() && latest > clip.start {
+            let mut bounds = vec![clip.start, latest];
+            bounds.extend(starts.iter().map(|start| start.clamp(clip.start, latest)));
+            bounds.sort_by(f64::total_cmp);
+            let candidates = bounds
+                .iter()
+                .copied()
+                .chain(bounds.windows(2).map(|pair| (pair[0] + pair[1]) * 0.5));
+            let distance = |start: f64| {
+                starts
+                    .iter()
+                    .map(|used| (start - used).abs())
+                    .fold(f64::INFINITY, f64::min)
+            };
+            if let Some(start) = candidates.max_by(|&a, &b| distance(a).total_cmp(&distance(b))) {
+                clip.set_slot_span(start, span);
+            }
+        }
+        starts.push(clip.start);
+    }
+    movie
+}
+
+fn fit_slots(clips: &mut [Clip], lengths: &[f64]) {
+    let mut next_duration = 0.0;
+    for (clip, &length) in clips.iter_mut().zip(lengths).rev() {
+        // Solve overlap <= fraction * (length + overlap) before sizing this clip.
+        let shared = if clip.transition_out == Transition::None {
+            0.0
+        } else {
+            TRANSITION_SECONDS
+                .min(MAX_OVERLAP_FRACTION * next_duration)
+                .min(MAX_OVERLAP_FRACTION / (1.0 - MAX_OVERLAP_FRACTION) * length)
+        };
+        clip.set_slot_span(clip.start, (length + shared) * clip.speed.rate());
+        next_duration = clip.duration();
+    }
+}
+
 pub fn build_from_template(
     segments: &[Segment],
     template: Template,
     duration: TargetDuration,
 ) -> Movie {
+    match template.info().kind {
+        TemplateKind::Free => build_free(segments, template, duration),
+        TemplateKind::Sync { .. } => build_from_slots(segments, template),
+    }
+}
+
+fn build_free(segments: &[Segment], template: Template, duration: TargetDuration) -> Movie {
     let profile = &TEMPLATES[template as usize];
     let mut order: Vec<_> = (0..segments.len())
-        .filter(|&index| {
-            let segment = &segments[index];
-            segment.start.is_finite()
-                && segment.end.is_finite()
-                && segment.start >= 0.0
-                && segment.end > segment.start
-        })
+        .filter(|&index| valid_segment(&segments[index]))
         .collect();
     order.sort_by(|&a, &b| segments[b].score.cmp(&segments[a].score).then(a.cmp(&b)));
     let target = duration.seconds();
@@ -385,20 +531,25 @@ pub fn build_from_template(
         let fraction = ((clip.end - clip.start) / (clip.limit_end - clip.start)) as f32;
         clip.end_view = panorama::interpolate_view(clip.view, clip.end_view, fraction);
     }
-    Movie {
-        clips: selected,
-        template,
-        target_duration: duration,
-        music: None,
-        original_audio_volume: 1.0,
-        music_volume: 1.0,
-        filter: Filter(0),
-        colore: Adjust::default(),
-        overlays: Overlays::default(),
-    }
+    Movie::with_clips(selected, template, duration)
 }
 
 impl Movie {
+    fn with_clips(clips: Vec<Clip>, template: Template, target_duration: TargetDuration) -> Self {
+        Self {
+            clips,
+            template,
+            target_duration,
+            music: None,
+            original_audio_volume: 1.0,
+            music_volume: 1.0,
+            filter: Filter(0),
+            colore: Adjust::default(),
+            overlays: Overlays::default(),
+            slot_lengths: Vec::new(),
+        }
+    }
+
     pub fn from_segment(segment: &Segment) -> Self {
         let mut movie = build_from_template(
             std::slice::from_ref(segment),
@@ -416,20 +567,65 @@ impl Movie {
     }
 
     pub fn replace(&mut self, selected: usize, segment: &Segment, segment_index: usize) {
-        if let Some(old) = self.clips.get_mut(selected) {
-            let mut new = Clip::from_segment(
-                segment,
-                segment_index,
-                &TEMPLATES[self.template as usize],
-                selected,
-            );
+        if !valid_segment(segment) {
+            return;
+        }
+        let Some(old) = self.clips.get_mut(selected) else {
+            return;
+        };
+        let mut new = if let TemplateKind::Sync { slots, .. } = self.template.info().kind {
+            Clip::from_slot(segment, segment_index, slots[selected], old.filter)
+        } else {
+            let mut new = Clip::source_clip(segment, segment_index);
             new.speed = old.speed;
             new.end = new.end.min(new.start + old.duration() * new.speed.rate());
             let fraction = ((new.end - new.start) / (new.limit_end - new.start)) as f32;
             new.end_view = panorama::interpolate_view(new.view, new.end_view, fraction);
             new.filter = old.filter;
             new.transition_out = old.transition_out;
-            *old = new;
+            new
+        };
+        new.saved_filter = old.saved_filter;
+        *old = new;
+        if !self.slot_lengths.is_empty() {
+            fit_slots(&mut self.clips, &self.slot_lengths);
+        }
+    }
+
+    pub fn slot_duration(&self, index: usize) -> Option<f64> {
+        self.slot_lengths.get(index).copied()
+    }
+
+    pub fn shortened_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slot_lengths
+            .iter()
+            .zip(&self.clips)
+            .enumerate()
+            .filter_map(|(i, (&length, clip))| {
+                let shared = self
+                    .clips
+                    .get(i + 1)
+                    .map_or(0.0, |next| overlap(clip, next));
+                (clip.duration() - shared < length - BEAT_REPORT_TOLERANCE).then_some(i)
+            })
+    }
+
+    pub fn template_filter_enabled(&self) -> bool {
+        self.clips
+            .first()
+            .is_none_or(|clip| clip.saved_filter.is_none())
+    }
+
+    pub fn set_template_filter(&mut self, enabled: bool) {
+        for clip in &mut self.clips {
+            if enabled {
+                if let Some(filter) = clip.saved_filter.take() {
+                    clip.filter = filter;
+                }
+            } else if clip.saved_filter.is_none() {
+                clip.saved_filter = Some(clip.filter);
+                clip.filter = Filter(0);
+            }
         }
     }
 
@@ -456,19 +652,17 @@ impl Movie {
     }
 
     pub fn sync_to_beats(&mut self, beats: &[f64]) -> usize {
+        if !self.slot_lengths.is_empty() {
+            return self.sync_slot_cuts(beats);
+        }
         let mut changed = 0;
         let mut start = 0.0;
         for i in 0..self.clips.len().saturating_sub(1) {
             let next = &self.clips[i + 1];
             let clip = &self.clips[i];
             let cut = start + clip.duration() - overlap(clip, next);
-            let after = beats.partition_point(|beat| *beat < cut);
-            let beat = [beats.get(after.wrapping_sub(1)), beats.get(after)]
-                .into_iter()
-                .flatten()
-                .min_by(|a, b| (*a - cut).abs().total_cmp(&(*b - cut).abs()));
             let mut revised = clip.clone();
-            if let Some(&beat) = beat.filter(|beat| (**beat - cut).abs() <= BEAT_SNAP_DISTANCE) {
+            if let Some(beat) = nearby_beat(beats, cut) {
                 // A short clip may contribute to the overlap. Solve for the new cut itself.
                 let min_end =
                     (clip.start + MIN_CLIP_SECONDS * clip.speed.rate()).min(clip.limit_end);
@@ -496,6 +690,56 @@ impl Movie {
         }
         changed
     }
+
+    fn sync_slot_cuts(&mut self, beats: &[f64]) -> usize {
+        let mut changed = 0;
+        let mut timeline = self.timeline();
+        for i in 1..self.clips.len() {
+            let start = timeline.starts[i];
+            let Some(beat) = nearby_beat(beats, start) else {
+                continue;
+            };
+            let delta = beat - start;
+            if delta.abs() <= BEAT_REPORT_TOLERANCE
+                || self.slot_lengths[i - 1] + delta < MIN_CLIP_SECONDS
+                || self.slot_lengths[i] - delta < MIN_CLIP_SECONDS
+            {
+                continue;
+            }
+            let mut candidate = self.clone();
+            candidate.slot_lengths[i - 1] += delta;
+            candidate.slot_lengths[i] -= delta;
+            fit_slots(&mut candidate.clips, &candidate.slot_lengths);
+            let revised = candidate.timeline();
+            let fits = (revised.end - timeline.end).abs() <= BEAT_REPORT_TOLERANCE
+                && revised.starts.iter().zip(&timeline.starts).enumerate().all(
+                    |(j, (new, old))| {
+                        let desired = if i == j { beat } else { *old };
+                        (*new - desired).abs() <= BEAT_REPORT_TOLERANCE
+                    },
+                );
+            if fits {
+                self.clips = candidate.clips;
+                self.slot_lengths = candidate.slot_lengths;
+                timeline = revised;
+                changed += 1;
+            }
+        }
+        changed
+    }
+}
+
+fn nearby_beat(beats: &[f64], cut: f64) -> Option<f64> {
+    let after = beats.partition_point(|beat| *beat < cut);
+    [
+        after.checked_sub(1).and_then(|index| beats.get(index)),
+        beats.get(after),
+    ]
+    .into_iter()
+    .flatten()
+    .copied()
+    .min_by(|a, b| (*a - cut).abs().total_cmp(&(*b - cut).abs()))
+    .filter(|beat| (*beat - cut).abs() <= BEAT_SNAP_DISTANCE)
 }
 
 pub struct Timeline {
@@ -1233,6 +1477,150 @@ mod tests {
     use crate::{autoedit::Scene, panorama::View};
     use image::Rgba;
     use std::sync::Arc;
+
+    fn highlight(start: f64, length: f64, score: u8) -> Segment {
+        Segment {
+            source: "source.mp4".into(),
+            start,
+            end: start + length,
+            view: View::default(),
+            start_view: View::default(),
+            end_view: View::default(),
+            score,
+            scene: Scene::Nature,
+            thumbnail: Arc::from([]),
+        }
+    }
+
+    #[test]
+    fn catalog_has_unique_names_and_complete_metadata() {
+        assert!(Template::ALL.len() >= 16);
+        assert_eq!(
+            &Template::LABELS[..8],
+            [
+                "Dinamico",
+                "Giornata in viaggio",
+                "A tempo",
+                "Energia",
+                "Ritmo della vita",
+                "Giornata d’avventura",
+                "Battito",
+                "Avventure"
+            ],
+        );
+        let mut names = BTreeSet::new();
+        for template in Template::ALL {
+            let info = template.info();
+            assert!(names.insert(template.label()));
+            assert_ne!(info.category.label(), "In evidenza");
+            assert!(!info.description.is_empty() && !info.music_query.is_empty());
+            assert!(info.bpm > 0);
+            assert_ne!(info.colors[0], info.colors[1]);
+        }
+    }
+
+    #[test]
+    fn sync_timeline_hits_bpm_grid_and_declared_duration_with_transitions() {
+        let segments: Vec<_> = (0..8)
+            .map(|i| highlight(f64::from(i) * 10.0, 8.0, 90))
+            .collect();
+        let mut sync_count = 0;
+        for template in Template::ALL {
+            let info = template.info();
+            let TemplateKind::Sync { slots, seconds, .. } = info.kind else {
+                continue;
+            };
+            sync_count += 1;
+            let movie = build_from_template(&segments, template, TargetDuration::Over180);
+            let timeline = movie.timeline();
+            let beat = 60.0 / f64::from(info.bpm);
+            assert_eq!(movie.clips.len(), slots.len(), "{template:?}");
+            assert!(
+                (timeline.end - seconds).abs() < 1.0 / f64::from(FPS),
+                "{template:?}"
+            );
+            let ends = timeline.starts[1..].iter().copied().chain([timeline.end]);
+            for ((start, end), slot) in timeline.starts.iter().zip(ends).zip(slots) {
+                let beats = (end - start) / beat;
+                assert!((beats - f64::from(slot.beats)).abs() < 1e-8, "{template:?}");
+                assert!(
+                    (end / beat - (end / beat).round()).abs() < 1e-8,
+                    "{template:?}"
+                );
+            }
+            assert_eq!(movie.shortened_slots().count(), 0);
+            assert!(movie.clips.iter().map(Clip::duration).sum::<f64>() > timeline.end);
+        }
+        assert!(sync_count > 0);
+    }
+
+    #[test]
+    fn sync_reuses_highlights_within_source_and_recovers_replaced_slot_duration() {
+        let segments = [
+            highlight(30.0, 9.0, 70),
+            highlight(10.0, 9.0, 70),
+            highlight(0.0, 0.2, 99),
+        ];
+        let mut movie = build_from_slots(&segments, Template::UrbanPulse);
+        assert_eq!(movie.clips.len(), 6);
+        assert_eq!(
+            movie
+                .clips
+                .iter()
+                .map(|clip| clip.segment_index)
+                .collect::<Vec<_>>(),
+            [2, 1, 0, 2, 1, 0]
+        );
+        assert_ne!(movie.clips[1].start, movie.clips[4].start);
+        assert_eq!(movie.shortened_slots().collect::<Vec<_>>(), [0, 3]);
+        for clip in &movie.clips {
+            let segment = &segments[clip.segment_index];
+            assert!(
+                segment.start <= clip.start && clip.start < clip.end && clip.end <= segment.end
+            );
+        }
+        assert!(build_from_slots(&[], Template::UrbanPulse).clips.is_empty());
+        movie.replace(0, &segments[1], 1);
+        movie.replace(3, &segments[0], 0);
+        assert_eq!(movie.shortened_slots().count(), 0);
+        assert!((movie.duration() - 15.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn sync_music_moves_cuts_without_changing_the_total() {
+        let segment = highlight(0.0, 8.0, 95);
+        let mut movie = build_from_slots(std::slice::from_ref(&segment), Template::UrbanPulse);
+        assert_eq!(movie.sync_to_beats(&[2.12]), 1);
+        assert!((movie.timeline().starts[1] - 2.12).abs() < 1e-8);
+        assert!((movie.duration() - 15.0).abs() < 1e-8);
+        movie.replace(0, &segment, 0);
+        assert!((movie.timeline().starts[1] - 2.12).abs() < 1e-8);
+        assert_eq!(movie.sync_to_beats(&[2.12]), 0);
+    }
+
+    #[test]
+    fn template_filter_toggle_restores_each_clip_even_after_replacement() {
+        let segment = highlight(0.0, 9.0, 80);
+        let mut movie = build_from_slots(std::slice::from_ref(&segment), Template::UrbanPulse);
+        movie.clips[1].filter = Filter(12);
+        movie.filter = Filter(4);
+        let original: Vec<_> = movie.clips.iter().map(|clip| clip.filter).collect();
+        assert!(movie.template_filter_enabled());
+        movie.set_template_filter(false);
+        movie.set_template_filter(false);
+        movie.replace(1, &segment, 0);
+        assert!(movie.clips.iter().all(|clip| clip.filter == Filter(0)));
+        assert_eq!(movie.filter, Filter(4));
+        movie.set_template_filter(true);
+        assert_eq!(
+            movie
+                .clips
+                .iter()
+                .map(|clip| clip.filter)
+                .collect::<Vec<_>>(),
+            original
+        );
+    }
 
     #[test]
     fn template_fills_the_target_within_one_clip_and_stays_in_source() {
