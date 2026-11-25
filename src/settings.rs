@@ -8,9 +8,8 @@ use eframe::egui::{self, Color32, RichText, Stroke, StrokeKind, Ui};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ai_provider::{
-        self, AiClient, AiConfig, ApiKey, ConnectionTest, Effort, ModelInfo, ProviderKind,
-    },
+    ai_cli::{self, CliTool},
+    ai_provider::{self, AiClient, AiConfig, ApiKey, ConnectionTest, ModelInfo, ProviderKind},
     app::Job,
     online::{self, Online},
     theme,
@@ -93,6 +92,12 @@ impl ModelCatalog {
         let Some(result) = Job::take(&mut self.job) else {
             return false;
         };
+        let changed_model = self.apply(config, result);
+        ctx.request_repaint();
+        changed_model
+    }
+
+    fn apply(&mut self, config: &mut AiConfig, result: Result<Vec<ModelInfo>, String>) -> bool {
         let result = result.map(|models| {
             let chosen = if models.iter().any(|model| model.id == config.model) {
                 None
@@ -107,13 +112,12 @@ impl ModelCatalog {
         });
         let changed_model = matches!(&result, Ok(Some(_)));
         self.result = Some(result);
-        ctx.request_repaint();
         changed_model
     }
 
     fn show_status(&self, ui: &mut Ui) {
         if self.job.is_some() {
-            theme::muted(ui, "Scarico l’elenco dei modelli…");
+            theme::muted(ui, "Carico l’elenco dei modelli…");
         } else if let Some(result) = &self.result {
             match result {
                 Ok(chosen) => {
@@ -135,6 +139,56 @@ impl ModelCatalog {
     }
 }
 
+#[derive(Default)]
+struct CliDiscovery {
+    job: Option<Job<Result<PathBuf, String>>>,
+    result: Option<Result<PathBuf, String>>,
+    retry_at: Option<Instant>,
+}
+
+impl CliDiscovery {
+    fn update(&mut self, ctx: &egui::Context, config: &AiConfig) {
+        if let Some(result) = Job::take(&mut self.job) {
+            self.result = Some(result);
+            ctx.request_repaint();
+        }
+        if self.job.is_some() || self.result.is_some() {
+            return;
+        }
+        if let Some(delay) = self
+            .retry_at
+            .and_then(|at| at.checked_duration_since(Instant::now()))
+        {
+            ctx.request_repaint_after(delay);
+            return;
+        }
+        self.retry_at = None;
+        let (tool, path) = (config.cli_tool, config.cli_path.clone());
+        self.job = Some(Job::start(ctx, move || {
+            ai_cli::resolve_executable(tool, &path)
+        }));
+    }
+
+    fn show(&self, ui: &mut Ui, automatic: bool) {
+        match &self.result {
+            Some(Ok(path)) => {
+                theme::muted(ui, format!("Trovato: {}", path.display()));
+            }
+            Some(Err(error)) => {
+                let message = if automatic {
+                    "Non trovato: installa il programma o indica il percorso."
+                } else {
+                    error
+                };
+                ui.colored_label(theme::ERROR, message);
+            }
+            None => {
+                theme::muted(ui, "Cerco il programma…");
+            }
+        }
+    }
+}
+
 pub struct Settings {
     pub preferences: Preferences,
     path: Option<PathBuf>,
@@ -149,6 +203,7 @@ pub struct Settings {
     ai_key: Result<Option<ApiKey>, String>,
     ai_key_input: String,
     ai_models: ModelCatalog,
+    cli_discovery: CliDiscovery,
     ai_test: Option<Job<Result<ConnectionTest, String>>>,
     ai_notice: Option<Result<&'static str, String>>,
 }
@@ -172,6 +227,7 @@ impl Settings {
             ai_key: Ok(None),
             ai_key_input: String::new(),
             ai_models: ModelCatalog::default(),
+            cli_discovery: CliDiscovery::default(),
             ai_test: None,
             ai_notice: None,
         };
@@ -277,8 +333,18 @@ impl Settings {
     }
 
     fn ai_client(&self) -> Result<AiClient, String> {
+        let config = &self.preferences.ai;
+        if config.kind == ProviderKind::LocalCli {
+            // Resolve the executable inside the connection or analysis worker.
+            ai_cli::validate_config(config)?;
+            let mut client = AiClient::new(config, None);
+            if self.ai_models.result.is_some() {
+                client = client.with_model_catalog(&self.ai_models.models);
+            }
+            return Ok(client);
+        }
         let key = self.ai_key.as_ref().map_err(Clone::clone)?;
-        let client = AiClient::new(&self.preferences.ai, key.as_ref());
+        let client = AiClient::new(config, key.as_ref());
         client.validate()?;
         Ok(client)
     }
@@ -317,6 +383,21 @@ impl Settings {
         }
         self.ai_models.refresh_on_open = false;
         self.ai_models.result = None;
+        let config = self.preferences.ai.clone();
+        if config.kind == ProviderKind::LocalCli {
+            self.ai_models.models.clear();
+            if config.cli_tool == CliTool::Claude {
+                let result = ai_provider::list_models(&config, None);
+                if self.ai_models.apply(&mut self.preferences.ai, result) {
+                    self.ai_notice = None;
+                }
+            } else {
+                self.ai_models.job = Some(Job::start(ctx, move || {
+                    ai_provider::list_models(&config, None)
+                }));
+            }
+            return;
+        }
         let key = match &self.ai_key {
             Ok(key) => key.clone(),
             Err(error) => {
@@ -324,7 +405,6 @@ impl Settings {
                 return;
             }
         };
-        let config = self.preferences.ai.clone();
         self.ai_models.job = Some(Job::start(ctx, move || {
             ai_provider::list_models(&config, key.as_ref())
         }));
@@ -355,6 +435,7 @@ impl Settings {
                 theme::muted(ui, "Internet è disattivato. L’Auto Edit usa l’analisi locale.");
             }
             ui.add_enabled_ui(online && self.ai_test.is_none(), |ui| self.ai_controls(ui));
+            let local_cli = self.preferences.ai.kind == ProviderKind::LocalCli;
             if let Some(result) = Job::take(&mut self.ai_test) {
                 self.ai_notice = Some(result.map(|outcome| match outcome {
                     ConnectionTest::Success => "Connessione riuscita.",
@@ -369,12 +450,18 @@ impl Settings {
                     Ok(message) => ui.colored_label(theme::OK, *message),
                     Err(error) => ui.colored_label(theme::ERROR, error),
                 };
-            } else if let Err(error) = &self.ai_key {
-                ui.colored_label(theme::ERROR, error);
+            } else if !local_cli {
+                if let Err(error) = &self.ai_key {
+                    ui.colored_label(theme::ERROR, error);
+                }
             }
             theme::muted(
                 ui,
-                "Le miniature delle scene scelte vengono inviate al servizio indicato. Per i server locali (Ollama, LM Studio) la chiave può restare vuota.",
+                if local_cli {
+                    "Usa l’accesso già fatto nel programma (abbonamento). Le miniature vengono inviate al servizio del programma."
+                } else {
+                    "Le miniature delle scene scelte vengono inviate al servizio indicato. Per i server locali (Ollama, LM Studio) la chiave può restare vuota."
+                },
             );
         });
         if std::mem::take(&mut self.focus_ai) {
@@ -416,16 +503,39 @@ impl Settings {
             }
             config.kind = kind;
             self.ai_models.clear();
+            self.cli_discovery = CliDiscovery::default();
             self.ai_notice = None;
         }
-        let address_changed = text_field(ui, "Indirizzo", &mut config.base_url).changed();
+        let local_cli = kind == ProviderKind::LocalCli;
+        let address_changed = if local_cli {
+            self.cli_controls(ui);
+            if provider_changed {
+                self.ai_models.refresh_on_open = true;
+            }
+            if ui.is_enabled()
+                && self.cli_discovery.retry_at.is_none()
+                && self.ai_models.refresh_on_open
+            {
+                self.refresh_models(ui.ctx());
+            }
+            if self.preferences.online
+                && self.ai_test.is_none()
+                && self.ai_models.poll(ui.ctx(), &mut self.preferences.ai)
+            {
+                self.ai_notice = None;
+            }
+            false
+        } else {
+            text_field(ui, "Indirizzo", &mut config.base_url).changed()
+        };
         if address_changed {
             self.ai_models.clear();
             self.ai_notice = None;
         }
+        let config = &mut self.preferences.ai;
         let model_selected = model_picker(ui, &self.ai_models.models, &mut config.model);
         let model_edited = text_field(ui, "Modello (manuale)", &mut config.model).changed();
-        let effort_changed = effort_picker(ui, &mut config.effort);
+        let effort_changed = effort_picker(ui, config, &self.ai_models.models);
         if model_selected || model_edited {
             if let Some(Ok(chosen)) = &mut self.ai_models.result {
                 *chosen = None;
@@ -436,11 +546,111 @@ impl Settings {
         }
         let update_clicked = ui
             .add_enabled(
-                self.ai_models.job.is_none(),
+                self.ai_models.job.is_none()
+                    && (!local_cli || self.cli_discovery.retry_at.is_none()),
                 egui::Button::new("Aggiorna elenco modelli"),
             )
             .clicked();
-        let mut refresh = provider_changed || update_clicked;
+        let can_refresh_models = if local_cli {
+            if update_clicked {
+                self.cli_discovery = CliDiscovery::default();
+                self.cli_discovery.update(ui.ctx(), &self.preferences.ai);
+                self.refresh_models(ui.ctx());
+            }
+            true
+        } else {
+            let refresh = self.ai_key_controls(ui) || provider_changed || update_clicked;
+            let can_refresh = matches!(self.ai_key, Ok(Some(_)))
+                || ai_provider::is_loopback_url(&self.preferences.ai.base_url);
+            let auto_refresh = self.ai_models.refresh_on_open && !address_changed;
+            if ui.is_enabled() && can_refresh && (refresh || auto_refresh) {
+                self.refresh_models(ui.ctx());
+            }
+            can_refresh
+        };
+        if !can_refresh_models {
+            theme::muted(ui, "Salva la chiave API per vedere l’elenco dei modelli.");
+        } else if self.preferences.online {
+            if !local_cli && self.ai_models.poll(ui.ctx(), &mut self.preferences.ai) {
+                self.ai_test = None;
+            }
+            self.ai_models.show_status(ui);
+        }
+        if ui.button("Prova connessione").clicked() {
+            self.ai_notice = None;
+            match self.ai_client() {
+                Ok(client) => {
+                    self.ai_test = Some(Job::start(ui.ctx(), move || client.test_connection()))
+                }
+                Err(error) => self.ai_notice = Some(Err(error)),
+            }
+        }
+    }
+
+    fn cli_controls(&mut self, ui: &mut Ui) {
+        let config = &mut self.preferences.ai;
+        let previous_tool = config.cli_tool;
+        let label = ui.label("Programma");
+        egui::ComboBox::from_id_salt("ai_cli_tool")
+            .selected_text(config.cli_tool.label())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for tool in CliTool::ALL {
+                    ui.selectable_value(&mut config.cli_tool, tool, tool.label());
+                }
+            })
+            .response
+            .labelled_by(label.id);
+        if config.cli_tool != previous_tool {
+            if self
+                .ai_models
+                .models
+                .iter()
+                .any(|model| model.id == config.model)
+            {
+                config.model.clear();
+            }
+            self.cli_discovery = CliDiscovery::default();
+            self.ai_models.clear();
+            self.ai_models.refresh_on_open = true;
+            self.ai_notice = None;
+        }
+        self.cli_discovery.show(ui, config.cli_path.is_empty());
+        let mut path_changed = text_field(
+            ui,
+            "Percorso del programma (facoltativo)",
+            &mut config.cli_path,
+        )
+        .changed();
+        let mut browse = false;
+        if ui.button("Sfoglia…").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Eseguibili Windows", &["exe"])
+                .pick_file()
+            {
+                let path = path.to_string_lossy();
+                path_changed |= config.cli_path != path;
+                config.cli_path = path.into_owned();
+                browse = true;
+            }
+        }
+        if path_changed {
+            self.cli_discovery = CliDiscovery {
+                // While typing, let the path settle before starting discovery or debug models.
+                retry_at: (!browse).then(|| Instant::now() + Duration::from_millis(350)),
+                ..CliDiscovery::default()
+            };
+            if config.cli_tool == CliTool::Codex {
+                self.ai_models.clear();
+                self.ai_models.refresh_on_open = true;
+            }
+            self.ai_notice = None;
+        }
+        self.cli_discovery.update(ui.ctx(), config);
+    }
+
+    fn ai_key_controls(&mut self, ui: &mut Ui) -> bool {
+        let mut refresh = false;
         let label = ui.label("Chiave API");
         let key_input = ui
             .add(
@@ -491,31 +701,7 @@ impl Settings {
                 },
             );
         });
-        let can_refresh_models = matches!(self.ai_key, Ok(Some(_)))
-            || ai_provider::is_loopback_url(&self.preferences.ai.base_url);
-        if ui.is_enabled() {
-            let auto_refresh = self.ai_models.refresh_on_open && !address_changed;
-            if can_refresh_models && (refresh || auto_refresh) {
-                self.refresh_models(ui.ctx());
-            }
-        }
-        if !can_refresh_models {
-            theme::muted(ui, "Salva la chiave API per vedere l’elenco dei modelli.");
-        } else if self.preferences.online {
-            if self.ai_models.poll(ui.ctx(), &mut self.preferences.ai) {
-                self.ai_test = None;
-            }
-            self.ai_models.show_status(ui);
-        }
-        if ui.button("Prova connessione").clicked() {
-            self.ai_notice = None;
-            match self.ai_client() {
-                Ok(client) => {
-                    self.ai_test = Some(Job::start(ui.ctx(), move || client.test_connection()))
-                }
-                Err(error) => self.ai_notice = Some(Err(error)),
-            }
-        }
+        refresh
     }
 
     fn online_card(&mut self, ui: &mut Ui, online: &Online) {
@@ -697,22 +883,22 @@ fn model_picker(ui: &mut Ui, models: &[ModelInfo], model: &mut String) -> bool {
     false
 }
 
-fn effort_picker(ui: &mut Ui, effort: &mut Effort) -> bool {
-    const LEVELS: [(Effort, &str); 4] = [
-        (Effort::Default, "Predefinito del modello"),
-        (Effort::Low, "Basso"),
-        (Effort::Medium, "Medio"),
-        (Effort::High, "Alto"),
-    ];
-    let previous = *effort;
+fn effort_picker(ui: &mut Ui, config: &mut AiConfig, models: &[ModelInfo]) -> bool {
+    let previous = config.effort;
+    let selected = config.effective_effort(models);
     let label = ui.label("Livello di ragionamento");
     egui::ComboBox::from_id_salt("ai_effort")
-        .selected_text(LEVELS[*effort as usize].1)
+        .selected_text(selected.label())
         .width(ui.available_width())
         .wrap()
         .show_ui(ui, |ui| {
-            for (value, label) in LEVELS {
-                ui.selectable_value(effort, value, label);
+            for value in config.available_efforts(models) {
+                if ui
+                    .selectable_label(selected == value, value.label())
+                    .clicked()
+                {
+                    config.effort = value;
+                }
             }
         })
         .response
@@ -721,7 +907,7 @@ fn effort_picker(ui: &mut Ui, effort: &mut Effort) -> bool {
         ui,
         "Più alto = risposte più ragionate ma più lente e costose.",
     );
-    *effort != previous
+    config.effort != previous
 }
 
 fn text_field(ui: &mut Ui, label: &str, text: &mut String) -> egui::Response {
@@ -868,6 +1054,7 @@ fn read_language<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_provider::Effort;
 
     #[test]
     fn write_ignores_short_unsaved_key_fragment() {
@@ -924,8 +1111,10 @@ mod tests {
         preferences.ai.model = "visione: \"uno,due\"".into();
         preferences.ai.effort = Effort::High;
         let json = serde_json::to_value(&preferences).unwrap();
-        assert_eq!(json["ai"].as_object().unwrap().len(), 5);
+        assert_eq!(json["ai"].as_object().unwrap().len(), 7);
         assert_eq!(json["ai"]["effort"], "high");
+        assert_eq!(json["ai"]["cli_tool"], "claude");
+        assert_eq!(json["ai"]["cli_path"], "");
         assert!(serde_json::from_value::<Preferences>(json).unwrap() == preferences);
     }
 }

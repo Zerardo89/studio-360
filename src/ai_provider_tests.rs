@@ -1,8 +1,344 @@
 use super::*;
+use crate::ai_cli::{self, CliTool};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
 };
+
+#[test]
+#[ignore = "usa la CLI Codex installata e l'abbonamento"]
+fn live_codex_cli_lists_models_and_reads_a_jpeg() {
+    let mut config = AiConfig {
+        kind: ProviderKind::LocalCli,
+        cli_tool: CliTool::Codex,
+        cli_path: String::new(),
+        effort: Effort::Low,
+        ..Default::default()
+    };
+
+    let executable = ai_cli::resolve_executable(config.cli_tool, &config.cli_path)
+        .expect("impossibile trovare la CLI Codex");
+    eprintln!("CLI Codex: {}", executable.display());
+    assert!(executable.is_file());
+    assert!(executable
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("codex.exe")));
+
+    let models = list_models(&config, None).expect("impossibile ottenere i modelli Codex");
+    assert!(!models.is_empty(), "il catalogo Codex è vuoto");
+    for model in &models {
+        assert!(!model.efforts.is_empty(), "nessun livello per {}", model.id);
+    }
+    for model in models.iter().take(5) {
+        eprintln!("Modello Codex: {}", model.id);
+    }
+    config.model = config
+        .suggested_model(&models)
+        .expect("nessun modello Codex suggerito")
+        .id
+        .clone();
+
+    let beach = RgbImage::from_fn(64, 64, |_, y| {
+        image::Rgb(if y < 32 { [135, 206, 235] } else { [238, 214, 175] })
+    });
+    let jpeg = encode_jpeg(&Thumbnail {
+        score: 0,
+        rgb: beach.as_raw(),
+        size: (64, 64),
+    })
+    .expect("impossibile codificare il JPEG di prova");
+
+    let client = AiClient::new(&config, None).with_model_catalog(&models);
+    let prompt = r#"Reply ONLY with JSON: {"scene":"beach|nature|city|snow|sunset|night"}"#;
+    let (response, _) = client
+        .send(prompt, &[jpeg], false)
+        .expect("la CLI Codex non ha risposto alla richiesta con il JPEG");
+    eprintln!("Risposta Codex: {response}");
+    assert!(response.contains(r#""scene""#));
+}
+
+#[test]
+fn cli_builds_exact_claude_arguments() {
+    let default = [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--restricted",
+        "--strict-mcp-config",
+        "--tools",
+        "",
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--model",
+        "sonnet",
+    ];
+    assert_eq!(ai_cli::claude_args("sonnet", None).unwrap(), default);
+    let mut explicit = default.to_vec();
+    explicit.extend(["--effort", "max"]);
+    assert_eq!(
+        ai_cli::claude_args("sonnet", Some("max")).unwrap(),
+        explicit
+    );
+}
+
+#[test]
+fn cli_builds_exact_codex_arguments() {
+    let dir = Path::new(r"C:\Temp\Studio 360");
+    let jpeg = dir.join("img-01.jpg");
+    let jpeg2 = dir.join("img-02.jpg");
+    let args = [
+        "exec",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "-s",
+        "read-only",
+        "--ignore-user-config",
+        "--color",
+        "never",
+        "-C",
+        r"C:\Temp\Studio 360",
+        "-m",
+        "gpt-5.4:vision",
+    ];
+    let mut default = args.to_vec();
+    default.extend(["-o", r"C:\Temp\Studio 360\out.txt", "-"]);
+    assert_eq!(
+        ai_cli::codex_args(dir, "gpt-5.4:vision", None, &[]).unwrap(),
+        default
+    );
+    let mut explicit = args.to_vec();
+    explicit.extend([
+        "-c",
+        r#"model_reasoning_effort="xhigh""#,
+        "-i",
+        r"C:\Temp\Studio 360\img-01.jpg",
+        "-i",
+        r"C:\Temp\Studio 360\img-02.jpg",
+        "-o",
+        r"C:\Temp\Studio 360\out.txt",
+        "-",
+    ]);
+    assert_eq!(
+        ai_cli::codex_args(dir, "gpt-5.4:vision", Some("xhigh"), &[jpeg, jpeg2]).unwrap(),
+        explicit
+    );
+}
+
+#[test]
+fn cli_rejects_invalid_model_and_effort_arguments() {
+    let directory = Path::new(".");
+    for invalid in [
+        "",
+        "--tools",
+        "with space",
+        "a\n",
+        "x\"y",
+        "è",
+        &"x".repeat(101),
+    ] {
+        assert!(ai_cli::claude_args(invalid, None).is_err());
+        assert!(ai_cli::codex_args(directory, invalid, None, &[]).is_err());
+        assert!(ai_cli::claude_args("sonnet", Some(invalid)).is_err());
+        assert!(ai_cli::codex_args(directory, "gpt-5", Some(invalid), &[]).is_err());
+    }
+    for unsupported in ["ultra", "default", "unknown"] {
+        assert!(ai_cli::claude_args("sonnet", Some(unsupported)).is_err());
+        assert!(ai_cli::codex_args(directory, "gpt-5", Some(unsupported), &[]).is_err());
+    }
+}
+
+#[test]
+fn codex_catalog_filters_visibility_and_sorts_by_priority() {
+    let models = ai_cli::parse_codex_models(
+        br#"{
+      "models": [
+        {"slug":"gpt-later","display_name":"Later","visibility":"list","priority":27,
+         "default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"}]},
+        {"slug":"gpt-hidden","display_name":"Hidden","visibility":"hide","priority":0},
+        {"slug":"gpt-suggested","display_name":"Suggested","visibility":"list","priority":3,
+         "default_reasoning_level":"high","supported_reasoning_levels":[
+           {"effort":"high"},{"effort":"xhigh"},{"effort":"ultra"},{"effort":"max"}]}
+      ]
+    }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["gpt-suggested", "gpt-later"]
+    );
+    assert_eq!(models[0].label, "Suggested");
+    assert_eq!(
+        models[0].efforts,
+        [Effort::High, Effort::XHigh, Effort::Max]
+    );
+    assert!(ai_cli::parse_codex_models(b"{ invalid").is_err());
+    assert!(ai_cli::parse_codex_models(b"{}").is_err());
+}
+
+#[test]
+fn claude_receives_one_user_message_with_jpegs_before_the_prompt() {
+    let input = ai_cli::claude_input("Riga 1\nRiga 2", &[vec![0xff, 0xd8, 0xff]]);
+    assert_eq!(input.iter().filter(|&&b| b == b'\n').count(), 1);
+    assert_eq!(input.last(), Some(&b'\n'));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&input).unwrap(),
+        json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"/9j/"}},
+                {"type":"text","text":"Riga 1\nRiga 2"}
+            ]}
+        })
+    );
+}
+
+#[test]
+fn claude_reads_only_the_stream_result_and_reports_errors() {
+    let stream = b"{\"type\":\"system\",\"subtype\":\"init\"}\r\n\
+        {\"type\":\"assistant\",\"message\":{}}\n\
+        {\"type\":\"result\",\"is_error\":false,\"result\":\"Verdetto\"}\n";
+    assert_eq!(
+        ai_cli::parse_claude_result(stream, b"warning").unwrap(),
+        "Verdetto"
+    );
+    assert_eq!(
+        ai_cli::parse_claude_result(
+            br#"{"type":"result","is_error":true,"result":"Sessione\u0007 scaduta"}"#,
+            b"warning"
+        )
+        .unwrap_err(),
+        "Sessione scaduta"
+    );
+    assert_eq!(
+        ai_cli::parse_claude_result(br#"{"type":"assistant"}"#, b"prima\nultima").unwrap_err(),
+        "prima ultima"
+    );
+    assert!(ai_cli::parse_claude_result(br#"{"type":"assistant"}"#, b"").is_err());
+}
+
+#[test]
+fn reasoning_menu_and_effective_effort_follow_provider_and_model() {
+    use Effort::{Default, High, Low, Max, Medium, XHigh};
+    let api = [Default, Low, Medium, High];
+    for kind in [
+        ProviderKind::OpenAiCompatible,
+        ProviderKind::Anthropic,
+        ProviderKind::Gemini,
+    ] {
+        let mut cfg = config(kind);
+        cfg.effort = XHigh;
+        assert_eq!(cfg.available_efforts(&[]), api);
+        assert_eq!(cfg.effective_effort(&[]), Default);
+    }
+    let mut cfg = config(ProviderKind::LocalCli);
+    cfg.effort = Max;
+    let claude = list_models(&cfg, None).unwrap();
+    assert_eq!(
+        claude.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["fable", "opus", "sonnet", "haiku"]
+    );
+    assert_eq!(cfg.suggested_model(&claude).unwrap().id, "sonnet");
+    assert_eq!(
+        cfg.available_efforts(&[]),
+        [Default, Low, Medium, High, XHigh, Max]
+    );
+    assert_eq!(cfg.effective_effort(&[]), Max);
+    cfg.cli_tool = CliTool::Codex;
+    let codex = vec![
+        ModelInfo {
+            id: "pinned".into(),
+            label: "Pinned".into(),
+            efforts: vec![Low, XHigh],
+        },
+        ModelInfo {
+            id: "no-effort".into(),
+            label: "No effort".into(),
+            efforts: vec![],
+        },
+    ];
+    assert_eq!(cfg.suggested_model(&codex).unwrap().id, "pinned");
+    assert_eq!(cfg.available_efforts(&codex), api);
+    assert_eq!(cfg.effective_effort(&codex), Default);
+    cfg.model = "pinned".into();
+    assert_eq!(cfg.available_efforts(&codex), [Default, Low, XHigh]);
+    assert_eq!(cfg.effective_effort(&codex), Default);
+    cfg.effort = XHigh;
+    assert_eq!(cfg.effective_effort(&codex), XHigh);
+    cfg.model = "no-effort".into();
+    assert_eq!(cfg.available_efforts(&codex), [Default]);
+    assert_eq!(cfg.effective_effort(&codex), Default);
+    assert_eq!(serde_json::to_value(&cfg).unwrap()["effort"], "xhigh");
+}
+
+#[test]
+fn cli_validates_the_explicit_executable_without_an_api_url_or_key() {
+    ai_cli::with_temp_dir(|dir| {
+        let mut cfg = config(ProviderKind::LocalCli);
+        cfg.base_url = "invalid API URL".into();
+
+        let script = dir.join("fake.cmd");
+        fs::write(&script, b"test").unwrap();
+        cfg.cli_path = script.to_string_lossy().into_owned();
+        assert!(AiClient::new(&cfg, None)
+            .validate()
+            .unwrap_err()
+            .contains("file .exe"));
+
+        let executable = dir.join("fake.EXE");
+        cfg.cli_path = executable.to_string_lossy().into_owned();
+        assert!(AiClient::new(&cfg, None)
+            .validate()
+            .unwrap_err()
+            .contains("non esiste"));
+        fs::create_dir(&executable).unwrap();
+        assert!(AiClient::new(&cfg, None).validate().is_err());
+        fs::remove_dir(&executable).unwrap();
+        fs::write(&executable, b"test fixture").unwrap();
+
+        for tool in CliTool::ALL {
+            cfg.cli_tool = tool;
+            assert!(AiClient::new(&cfg, None).validate().is_ok());
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn cli_timeout_stops_the_process_and_cleans_up_its_directory() {
+    use std::{path::PathBuf, time::Instant};
+
+    let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let started = Instant::now();
+    let mut directory = PathBuf::new();
+    let result = ai_cli::with_temp_dir(|path| {
+        directory = path.to_owned();
+        fs::write(path.join("img-01.jpg"), b"test").unwrap();
+        ai_cli::run_process(
+            &powershell,
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ],
+            path,
+            vec![0; 1024 * 1024],
+            ai_cli::RunLimits::new(Duration::from_secs(1), 2 * 1024 * 1024),
+        )
+        .map(|_| ())
+    });
+    assert_eq!(
+        result.unwrap_err(),
+        "il programma AI non ha risposto entro 1 s"
+    );
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert!(!directory.exists());
+}
 
 fn config(kind: ProviderKind) -> AiConfig {
     AiConfig {
@@ -33,7 +369,10 @@ fn old_config_defaults_to_model_effort() {
     }))
     .unwrap();
     assert_eq!(cfg.effort, Effort::Default);
-    assert_eq!(serde_json::to_value(cfg).unwrap()["effort"], "default");
+    let saved = serde_json::to_value(cfg).unwrap();
+    assert_eq!(saved["effort"], "default");
+    assert_eq!(saved["cli_tool"], "claude");
+    assert_eq!(saved["cli_path"], "");
 }
 
 #[test]
@@ -81,6 +420,8 @@ fn explicit_effort_uses_provider_specific_fields() {
         (Effort::Low, "low", 1024),
         (Effort::Medium, "medium", 8192),
         (Effort::High, "high", 24576),
+        (Effort::XHigh, "high", 24576),
+        (Effort::Max, "high", 24576),
     ] {
         for test in [false, true] {
             let mut cfg = config(ProviderKind::OpenAiCompatible);
@@ -202,6 +543,7 @@ fn official_openai_prefers_a_chat_model_over_specialized_variants() {
     let chat = ModelInfo {
         id: "gpt-5".into(),
         label: "GPT-5".into(),
+        efforts: vec![],
     };
     for id in [
         "gpt-5-pro-2025-10-06",
@@ -214,6 +556,7 @@ fn official_openai_prefers_a_chat_model_over_specialized_variants() {
             ModelInfo {
                 id: id.into(),
                 label: id.into(),
+                efforts: vec![],
             },
             chat.clone(),
         ];
@@ -301,7 +644,11 @@ fn base64_rfc4648() {
 #[test]
 fn request_formats_and_secret_headers() {
     let key = ApiKey::new("sample-secret").unwrap();
-    for kind in ProviderKind::ALL {
+    for kind in [
+        ProviderKind::OpenAiCompatible,
+        ProviderKind::Anthropic,
+        ProviderKind::Gemini,
+    ] {
         let mut cfg = config(kind);
         cfg.base_url.push_str("///");
         cfg.model = "vision/uno ?".into();
@@ -358,6 +705,7 @@ fn request_formats_and_secret_headers() {
                     "sample-secret",
                 )
             }
+            ProviderKind::LocalCli => unreachable!(),
         };
         assert_eq!(request.uri().path(), path);
         assert_eq!(request.headers()[header], value);

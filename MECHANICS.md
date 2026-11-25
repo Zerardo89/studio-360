@@ -435,7 +435,8 @@ cookie o dati dei file locali. Le richieste e le operazioni di cache girano su w
 
 ## AI personale
 
-In **Impostazioni → AI personale** si sceglie un servizio, il suo indirizzo e un modello con visione.
+In **Impostazioni → AI personale** si sceglie un servizio e un modello con visione. Per un servizio
+API si può indicare anche l’indirizzo.
 L’interruttore è spento per impostazione predefinita. **Prova connessione** invia «Reply with OK»
 come richiesta di solo testo. Per Ollama e LM Studio si usa il servizio compatibile OpenAI e si può
 lasciare vuota la chiave.
@@ -445,6 +446,7 @@ lasciare vuota la chiave.
 | Compatibile OpenAI, incluso OpenRouter | `https://api.openai.com/v1` | POST `/chat/completions` con JPEG in URL dati e header `Authorization: Bearer` quando è presente una chiave |
 | Anthropic | `https://api.anthropic.com/v1` | POST `/messages` con blocchi immagine JPEG in Base64 e header `x-api-key` |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta` | POST `/models/{modello}:generateContent` con JPEG in Base64 nei dati inline e header `x-goog-api-key` |
+| Programma AI installato | Accesso già effettuato in Claude Code o Codex | Prompt su stdin, con JPEG in Base64 per Claude Code e file JPEG temporanei per Codex |
 
 **Aggiorna elenco modelli** scarica il catalogo in background quando internet è attivo. La card lo
 richiede anche al cambio di servizio, dopo il salvataggio della chiave e all’apertura se l’elenco è
@@ -460,7 +462,7 @@ compatibili OpenAI si usa il primo modello restituito.
 | Anthropic | GET `/models?limit=100`. Se `has_more` è vero usa `last_id` come `after_id` |
 | Google Gemini | GET `/models?pageSize=1000`. Usa `nextPageToken` come `pageToken` e tiene i modelli generativi compatibili con `generateContent` dopo i filtri |
 
-Il catalogo resta in memoria e comprende al massimo 10 pagine. Gli id validi hanno da 1 a 200
+Il catalogo API resta in memoria e comprende al massimo 10 pagine. Gli id validi hanno da 1 a 200
 caratteri, senza duplicati, caratteri di controllo o riferimenti alla chiave.
 
 | Livello di ragionamento | Valore salvato | Budget Gemini 2.x |
@@ -469,31 +471,64 @@ caratteri, senza duplicati, caratteri di controllo o riferimenti alla chiave.
 | Basso | `low` | 1024 |
 | Medio | `medium` | 8192 |
 | Alto | `high` | 24576 |
+| Molto alto, per CLI | `xhigh` | |
+| Massimo, per CLI | `max` | |
 
 Il livello predefinito usa `max_tokens: 1500` per OpenAI compatibile e Anthropic. Per gli altri
 livelli, OpenAI compatibile riceve `reasoning_effort` e `max_completion_tokens: 16000`, senza
 `temperature`. Anthropic riceve `output_config.effort` e `max_tokens: 8000`. Gemini riceve
 `thinkingConfig` con `thinkingBudget` per gli id che iniziano con `gemini-2` e `thinkingLevel`
 per gli altri. Su HTTP 400, l’Auto Edit e **Prova connessione** ripetono una volta la richiesta con il
-livello predefinito. La prova segnala quando riesce con questo ripiego.
+livello predefinito. La prova segnala quando riesce con questo ripiego. I menu delle API arrivano
+ad **Alto**. Se è rimasto salvato `xhigh` o `max`, il corpo della richiesta API usa `high`.
 
 L’Auto Edit di foto e video parte dall’analisi locale. Invia al massimo le 12 miniature rettilinee
 con il punteggio locale più alto, con lato massimo di 512 px, in JPEG qualità 80. La richiesta
-contiene le miniature senza il file originale o i suoi metadati. Il timeout globale è di 90 s e
-il corpo della risposta è limitato a 2 MiB. Il modello restituisce un verdetto JSON con punteggio,
+contiene le miniature senza il file originale o i suoi metadati. Per le API il timeout globale è di
+90 s e il corpo della risposta è limitato a 2 MiB. Il modello restituisce un verdetto JSON con punteggio,
 scena e selezione delle clip, un filtro, un modello di filmato e un breve titolo in italiano.
 Le candidate che il modello non valuta conservano i risultati locali.
 
 Se l’AI è spenta, manca una configurazione valida, internet è disattivato o la richiesta fallisce,
-l’Auto Edit mostra il motivo e usa il risultato locale. Il collegamento richiede HTTPS, con HTTP
+l’Auto Edit mostra il motivo e usa il risultato locale. Il collegamento alle API richiede HTTPS, con HTTP
 ammesso per `localhost`, `127.0.0.1` e `[::1]`.
 
 **Indirizzo**, **Modello (manuale)** e **Chiave API** supportano Ctrl+V e **Incolla** nel menu
 contestuale. I primi due campi offrono anche **Copia** e **Seleziona tutto**. La chiave è cifrata da
 Windows DPAPI per l’utente corrente in `%APPDATA%\Studio360\ai-key.bin`. **Rimuovi chiave** elimina
 il file. Per l’AI, `settings.json` salva il servizio, l’indirizzo, il modello, il livello di
-ragionamento e lo stato dell’interruttore. La chiave viaggia nell’header della richiesta e viene
-oscurata nei messaggi d’errore HTTP.
+ragionamento, lo stato dell’interruttore, il tipo di programma e il percorso indicato manualmente.
+La chiave viaggia nell’header della richiesta API e viene oscurata nei messaggi d’errore HTTP.
+
+### Claude Code e Codex
+
+**Programma AI installato (Claude Code, Codex) – senza chiave API** usa la sessione aperta nel
+programma scelto. Internet deve essere attivo nelle impostazioni. La card mostra il percorso
+trovato in background. **Sfoglia…** o il campo **Percorso del programma (facoltativo)** permettono
+di indicare un file `.exe`. La ricerca automatica consulta `PATH`, poi
+`%USERPROFILE%\.local\bin\claude.exe` per Claude Code e la posizione del pacchetto Store
+`OpenAI.Codex_2p2nqsd0c76g0` per Codex. Il percorso rilevato automaticamente resta in memoria.
+
+Claude Code offre gli alias `fable`, `opus`, `sonnet` e `haiku`, con `sonnet` suggerito. Il
+menu offre **Predefinito del modello**, **Basso**, **Medio**, **Alto**, **Molto alto** e **Massimo**.
+Codex carica in background `debug models` e tiene i modelli con `visibility: "list"` in ordine
+crescente di `priority`. Suggerisce il primo modello. Per ciascun modello offre il livello
+predefinito e i livelli dichiarati dal catalogo tra `low`, `medium`, `high`, `xhigh` e `max`.
+Per un modello senza voce nel catalogo il menu offre il predefinito, `low`, `medium` e `high`.
+Quando il catalogo di Codex è indisponibile, si può usare il campo **Modello (manuale)**.
+Quando il livello salvato per la CLI è indisponibile, viene usato il predefinito del modello.
+
+Gli ID e i livelli passati alla CLI hanno al massimo 100 caratteri tra `A–Z`, `a–z`, `0–9` e
+`._:-`, con il primo carattere diverso da `-`. Claude Code usa JSON a righe e legge il campo
+`result`. Le opzioni limitano strumenti, hook, plugin, MCP e persistenza della sessione. Codex usa
+`exec` in modalità effimera e in sola lettura, con la risposta finale in `out.txt`. Il verdetto
+usa lo stesso formato dell’API. L’analisi mostra il nome del programma e l’ID del modello.
+
+Ogni esecuzione usa una cartella univoca sotto `%TEMP%`, rimossa al termine. I processi partono
+senza finestra e appartengono a un Job Object che termina anche i figli. L’analisi e la prova
+connessione hanno un timeout di 300 s. `debug models` ha un timeout di 60 s. Le pipe di stdout e
+stderr sono limitate a 2 MiB ciascuna, oppure a 8 MiB per il catalogo. Il file `out.txt` è limitato
+a 2 MiB. Gli errori del programma riportano fino a 300 caratteri.
 
 ## Esportazione immagini
 Risoluzioni 720P, 1080P, 2.7K, **4K** (lato lungo 1280, 1920, 2720, 3840 px): il massimo 4K è confermato dal

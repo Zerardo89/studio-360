@@ -29,6 +29,7 @@ use windows::{
 };
 
 use crate::{
+    ai_cli::{self, CliTool},
     autoedit::Scene,
     movie::{Filter, Template},
     panorama::FILTERS,
@@ -66,14 +67,21 @@ pub enum ProviderKind {
     OpenAiCompatible,
     Anthropic,
     Gemini,
+    LocalCli,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 3] = [Self::OpenAiCompatible, Self::Anthropic, Self::Gemini];
+    pub const ALL: [Self; 4] = [
+        Self::OpenAiCompatible,
+        Self::Anthropic,
+        Self::Gemini,
+        Self::LocalCli,
+    ];
     pub const LABELS: &[&str] = &[
         "Compatibile OpenAI (OpenAI, OpenRouter, Ollama, LM Studio…)",
         "Anthropic",
         "Google Gemini",
+        "Programma AI installato (Claude Code, Codex) – senza chiave API",
     ];
 
     pub fn default_url(self) -> &'static str {
@@ -81,6 +89,7 @@ impl ProviderKind {
             Self::OpenAiCompatible => "https://api.openai.com/v1",
             Self::Anthropic => "https://api.anthropic.com/v1",
             Self::Gemini => "https://generativelanguage.googleapis.com/v1beta",
+            Self::LocalCli => "",
         }
     }
 }
@@ -93,15 +102,44 @@ pub enum Effort {
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
 }
 
 impl Effort {
-    fn level(self) -> Option<(&'static str, u32)> {
+    const STANDARD: [Self; 4] = [Self::Default, Self::Low, Self::Medium, Self::High];
+    pub(crate) const EXPLICIT: [Self; 5] =
+        [Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Predefinito del modello",
+            Self::Low => "Basso",
+            Self::Medium => "Medio",
+            Self::High => "Alto",
+            Self::XHigh => "Molto alto",
+            Self::Max => "Massimo",
+        }
+    }
+
+    pub(crate) fn cli_level(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+        }
+    }
+
+    fn api_level(self) -> Option<(&'static str, u32)> {
         match self {
             Self::Default => None,
             Self::Low => Some(("low", 1024)),
             Self::Medium => Some(("medium", 8192)),
-            Self::High => Some(("high", 24576)),
+            Self::High | Self::XHigh | Self::Max => Some(("high", 24576)),
         }
     }
 }
@@ -114,6 +152,8 @@ pub struct AiConfig {
     pub base_url: String,
     pub model: String,
     pub effort: Effort,
+    pub cli_tool: CliTool,
+    pub cli_path: String,
 }
 
 impl Default for AiConfig {
@@ -124,12 +164,41 @@ impl Default for AiConfig {
             base_url: ProviderKind::default().default_url().into(),
             model: String::new(),
             effort: Effort::Default,
+            cli_tool: CliTool::default(),
+            cli_path: String::new(),
         }
     }
 }
 
 impl AiConfig {
+    pub fn available_efforts(&self, models: &[ModelInfo]) -> Vec<Effort> {
+        if self.kind == ProviderKind::LocalCli {
+            if self.cli_tool == CliTool::Claude {
+                return std::iter::once(Effort::Default)
+                    .chain(Effort::EXPLICIT)
+                    .collect();
+            }
+            if let Some(model) = models.iter().find(|model| model.id == self.model) {
+                return std::iter::once(Effort::Default)
+                    .chain(model.efforts.iter().copied())
+                    .collect();
+            }
+        }
+        Effort::STANDARD.to_vec()
+    }
+
+    pub fn effective_effort(&self, models: &[ModelInfo]) -> Effort {
+        if self.available_efforts(models).contains(&self.effort) {
+            self.effort
+        } else {
+            Effort::Default
+        }
+    }
+
     pub fn suggested_model<'a>(&self, models: &'a [ModelInfo]) -> Option<&'a ModelInfo> {
+        if self.kind == ProviderKind::LocalCli && self.cli_tool == CliTool::Claude {
+            return models.iter().find(|model| model.id == "sonnet");
+        }
         if self.kind == ProviderKind::OpenAiCompatible
             && !validate_url(self.base_url.trim())
                 .ok()
@@ -169,6 +238,7 @@ impl ApiKey {
 pub struct AiClient {
     config: AiConfig,
     key: Option<ApiKey>,
+    cli_effort: Option<Effort>,
 }
 
 pub enum ConnectionTest {
@@ -180,11 +250,22 @@ impl AiClient {
     pub fn new(config: &AiConfig, key: Option<&ApiKey>) -> Self {
         Self {
             config: config.clone(),
-            key: key.cloned(),
+            key: key
+                .filter(|_| config.kind != ProviderKind::LocalCli)
+                .cloned(),
+            cli_effort: None,
         }
     }
 
+    pub fn with_model_catalog(mut self, models: &[ModelInfo]) -> Self {
+        self.cli_effort = Some(self.config.effective_effort(models));
+        self
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        if self.config.kind == ProviderKind::LocalCli {
+            return ai_cli::validated_executable(&self.config).map(|_| ());
+        }
         endpoint(&self.config, self.key.as_ref()).map(|_| ())
     }
 
@@ -199,7 +280,7 @@ impl AiClient {
         }
         let images = indices
             .iter()
-            .map(|&index| encode_jpeg(&candidates[index]).map(|jpeg| base64(&jpeg)))
+            .map(|&index| encode_jpeg(&candidates[index]))
             .collect::<Result<Vec<_>, _>>()?;
         let (text, _) = self.send(&prompt(), &images, false)?;
         let mut verdict = parse_verdict(&text, indices.len())?;
@@ -225,11 +306,16 @@ impl AiClient {
     fn send(
         &self,
         text: &str,
-        images: &[String],
+        images: &[Vec<u8>],
         test: bool,
     ) -> Result<(String, ConnectionTest), String> {
+        if self.config.kind == ProviderKind::LocalCli {
+            return ai_cli::send(&self.config, self.cli_effort, text, images)
+                .map(|response| (response, ConnectionTest::Success));
+        }
+        let images: Vec<_> = images.iter().map(|jpeg| base64(jpeg)).collect();
         let key = self.key.as_ref();
-        let request = build_request(&self.config, key, text, images, test)?;
+        let request = build_request(&self.config, key, text, &images, test)?;
         let agent = http_agent(request.uri());
         let response = agent.run(request).map_err(transport_error)?;
         let (response, outcome) = if response.status() == StatusCode::BAD_REQUEST
@@ -238,7 +324,7 @@ impl AiClient {
             drop(response);
             let mut fallback = self.config.clone();
             fallback.effort = Effort::Default;
-            let request = build_request(&fallback, key, text, images, test)?;
+            let request = build_request(&fallback, key, text, &images, test)?;
             (
                 agent.run(request).map_err(transport_error)?,
                 ConnectionTest::UsedDefaultEffort,
@@ -255,10 +341,14 @@ impl AiClient {
 pub struct ModelInfo {
     pub id: String,
     pub label: String,
+    pub efforts: Vec<Effort>,
 }
 
 /// Recupera un catalogo in memoria usando lo stesso trasporto delle richieste AI.
 pub fn list_models(config: &AiConfig, key: Option<&ApiKey>) -> Result<Vec<ModelInfo>, String> {
+    if config.kind == ProviderKind::LocalCli {
+        return ai_cli::list_models(config);
+    }
     let (base, uri) = provider_base(config, key)?;
     let host = uri.host().expect("validate_url richiede un host");
     let kind = config.kind;
@@ -270,6 +360,7 @@ pub fn list_models(config: &AiConfig, key: Option<&ApiKey>) -> Result<Vec<ModelI
         ProviderKind::OpenAiCompatible => (String::new(), ""),
         ProviderKind::Anthropic => (format!("?limit={ANTHROPIC_PAGE_SIZE}"), "after_id"),
         ProviderKind::Gemini => (format!("?pageSize={GEMINI_PAGE_SIZE}"), "pageToken"),
+        ProviderKind::LocalCli => unreachable!(),
     };
     let first_page = format!("{base}/models{query}");
     let mut url = first_page.clone();
@@ -354,6 +445,7 @@ fn parse_models(kind: ProviderKind, host: &str, body: &Value) -> (Vec<ModelInfo>
                 .flatten(),
         ),
         ProviderKind::Gemini => (&body["models"], body["nextPageToken"].as_str()),
+        ProviderKind::LocalCli => unreachable!(),
     };
     let mut entries: Vec<_> = items
         .as_array()
@@ -379,6 +471,7 @@ fn parse_models(kind: ProviderKind, host: &str, body: &Value) -> (Vec<ModelInfo>
                         item["displayName"].as_str(),
                     )
                 }
+                ProviderKind::LocalCli => unreachable!(),
             };
             let clean_id = id.trim();
             if clean_id.is_empty()
@@ -407,6 +500,7 @@ fn parse_models(kind: ProviderKind, host: &str, body: &Value) -> (Vec<ModelInfo>
         .map(|(id, label, _)| ModelInfo {
             id: id.into(),
             label: label.into(),
+            efforts: Vec::new(),
         })
         .collect();
     (
@@ -429,7 +523,7 @@ fn contains_any(text: &str, fragments: &[&str]) -> bool {
 /// I modelli OpenAI sono già ordinati per data dal parser del catalogo ufficiale.
 pub fn suggested_model(kind: ProviderKind, models: &[ModelInfo]) -> Option<&ModelInfo> {
     let preferred = match kind {
-        ProviderKind::Anthropic => models.first(),
+        ProviderKind::Anthropic | ProviderKind::LocalCli => models.first(),
         ProviderKind::OpenAiCompatible => {
             let mut compatible = models.iter().filter(|model| {
                 !contains_any(
@@ -577,10 +671,14 @@ pub fn analyze(
         progress(AI_PHASE);
         let verdict = client.request_verdict(candidates)?;
         let model = client.config.model.trim();
-        let model = client
-            .key
-            .as_ref()
-            .map_or_else(|| model.to_owned(), |key| key.redact(model));
+        let model = if client.config.kind == ProviderKind::LocalCli {
+            format!("{} · {model}", client.config.cli_tool.label())
+        } else {
+            client
+                .key
+                .as_ref()
+                .map_or_else(|| model.to_owned(), |key| key.redact(model))
+        };
         Ok((model, verdict))
     });
     match result {
@@ -659,6 +757,7 @@ fn endpoint(config: &AiConfig, key: Option<&ApiKey>) -> Result<String, String> {
             "models/{}:generateContent",
             utf8_percent_encode(model, URL_COMPONENT_ESCAPE)
         ),
+        ProviderKind::LocalCli => unreachable!(),
     };
     let url = format!("{base}/{suffix}");
     if key.is_some_and(|key| key.appears_in(&url)) {
@@ -677,6 +776,7 @@ fn provider_headers(
             ProviderKind::OpenAiCompatible => ("authorization", format!("Bearer {}", key.0)),
             ProviderKind::Anthropic => ("x-api-key", key.0.clone()),
             ProviderKind::Gemini => ("x-goog-api-key", key.0.clone()),
+            ProviderKind::LocalCli => unreachable!(),
         };
         let mut value = HeaderValue::from_str(&secret).map_err(|_| "chiave API non valida")?;
         value.set_sensitive(true);
@@ -701,7 +801,7 @@ fn build_request(
         key,
     )?;
     let model = config.model.trim();
-    let effort = config.effort.level();
+    let effort = config.effort.api_level();
     let body = match config.kind {
         ProviderKind::OpenAiCompatible => {
             let mut content = vec![json!({"type":"text","text":text})];
@@ -751,6 +851,7 @@ fn build_request(
             }
             json!({"contents":[{"parts":parts}],"generationConfig":generation})
         }
+        ProviderKind::LocalCli => unreachable!(),
     };
     request
         .body(body.to_string().into_bytes())
@@ -812,6 +913,7 @@ fn response_text(kind: ProviderKind, body: &Value) -> Result<String, String> {
             .to_owned(),
         ProviderKind::Anthropic => join_text(&body["content"], |part| part["type"] == "text"),
         ProviderKind::Gemini => join_text(&body["candidates"][0]["content"]["parts"], |_| true),
+        ProviderKind::LocalCli => unreachable!(),
     };
     if text.trim().is_empty() {
         return Err("il servizio AI ha risposto senza testo".into());
@@ -943,7 +1045,7 @@ fn encode_jpeg(candidate: &Thumbnail<'_>) -> Result<Vec<u8>, String> {
     Ok(jpeg)
 }
 
-fn base64(data: &[u8]) -> String {
+pub(crate) fn base64(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
