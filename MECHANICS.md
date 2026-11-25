@@ -446,6 +446,37 @@ lasciare vuota la chiave.
 | Anthropic | `https://api.anthropic.com/v1` | POST `/messages` con blocchi immagine JPEG in Base64 e header `x-api-key` |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta` | POST `/models/{modello}:generateContent` con JPEG in Base64 nei dati inline e header `x-goog-api-key` |
 
+**Aggiorna elenco modelli** scarica il catalogo in background quando internet è attivo. La card lo
+richiede anche al cambio di servizio, dopo il salvataggio della chiave e all’apertura se l’elenco è
+vuoto e il servizio è compatibile OpenAI o ha una chiave salvata. La scelta nel menu aggiorna
+**Modello (manuale)**, che resta modificabile. Se l’id corrente manca dall’elenco, viene suggerito
+il modello più recente di Anthropic, il GPT principale più recente su `api.openai.com` oppure il
+Gemini stabile con la versione più alta, con priorità a Pro a parità di versione. Per gli altri server
+compatibili OpenAI si usa il primo modello restituito.
+
+| Servizio | Richiesta del catalogo |
+| --- | --- |
+| Compatibile OpenAI | GET `/models`. Su `api.openai.com` ordina per `created` e filtra i modelli specializzati |
+| Anthropic | GET `/models?limit=100`. Se `has_more` è vero usa `last_id` come `after_id` |
+| Google Gemini | GET `/models?pageSize=1000`. Usa `nextPageToken` come `pageToken` e tiene i modelli generativi compatibili con `generateContent` dopo i filtri |
+
+Il catalogo resta in memoria e comprende al massimo 10 pagine. Gli id validi hanno da 1 a 200
+caratteri, senza duplicati, caratteri di controllo o riferimenti alla chiave.
+
+| Livello di ragionamento | Valore salvato | Budget Gemini 2.x |
+| --- | --- | ---: |
+| Predefinito del modello | `default` | del modello |
+| Basso | `low` | 1024 |
+| Medio | `medium` | 8192 |
+| Alto | `high` | 24576 |
+
+Il livello predefinito usa `max_tokens: 1500` per OpenAI compatibile e Anthropic. Per gli altri
+livelli, OpenAI compatibile riceve `reasoning_effort` e `max_completion_tokens: 16000`, senza
+`temperature`. Anthropic riceve `output_config.effort` e `max_tokens: 8000`. Gemini riceve
+`thinkingConfig` con `thinkingBudget` per gli id che iniziano con `gemini-2` e `thinkingLevel`
+per gli altri. Su HTTP 400, l’Auto Edit e **Prova connessione** ripetono una volta la richiesta con il
+livello predefinito. La prova segnala quando riesce con questo ripiego.
+
 L’Auto Edit di foto e video parte dall’analisi locale. Invia al massimo le 12 miniature rettilinee
 con il punteggio locale più alto, con lato massimo di 512 px, in JPEG qualità 80. La richiesta
 contiene le miniature senza il file originale o i suoi metadati. Il timeout globale è di 90 s e
@@ -457,10 +488,12 @@ Se l’AI è spenta, manca una configurazione valida, internet è disattivato o 
 l’Auto Edit mostra il motivo e usa il risultato locale. Il collegamento richiede HTTPS, con HTTP
 ammesso per `localhost`, `127.0.0.1` e `[::1]`.
 
-La chiave è cifrata da Windows DPAPI per l’utente corrente in `%APPDATA%\Studio360\ai-key.bin`.
-**Rimuovi chiave** elimina il file. `settings.json` contiene solo il servizio, l’indirizzo, il
-modello e lo stato dell’interruttore per l’AI. La chiave viaggia nell’header della richiesta e
-viene oscurata nei messaggi d’errore HTTP.
+**Indirizzo**, **Modello (manuale)** e **Chiave API** supportano Ctrl+V e **Incolla** nel menu
+contestuale. I primi due campi offrono anche **Copia** e **Seleziona tutto**. La chiave è cifrata da
+Windows DPAPI per l’utente corrente in `%APPDATA%\Studio360\ai-key.bin`. **Rimuovi chiave** elimina
+il file. Per l’AI, `settings.json` salva il servizio, l’indirizzo, il modello, il livello di
+ragionamento e lo stato dell’interruttore. La chiave viaggia nell’header della richiesta e viene
+oscurata nei messaggi d’errore HTTP.
 
 ## Esportazione immagini
 Risoluzioni 720P, 1080P, 2.7K, **4K** (lato lungo 1280, 1920, 2720, 3840 px): il massimo 4K è confermato dal

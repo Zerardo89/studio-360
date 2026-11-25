@@ -1,6 +1,8 @@
 //! Vision provider requests and per-user Windows credential storage.
 
 use std::{
+    cmp::Reverse,
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::{self, Write},
     path::Path,
@@ -12,8 +14,9 @@ use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ureq::{
-    http::{HeaderValue, Request, Uri},
+    http::{request::Builder, HeaderValue, Request, Response, StatusCode, Uri},
     tls::{RootCerts, TlsConfig, TlsProvider},
+    Agent, Body,
 };
 use windows::{
     core::PCWSTR,
@@ -36,6 +39,13 @@ const MAX_EDGE: u32 = 512;
 const JPEG_QUALITY: u8 = 80;
 const RESPONSE_LIMIT: u64 = 2 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_MODEL_PAGES: usize = 10;
+const MAX_MODEL_ID_CHARS: usize = 200;
+const ANTHROPIC_PAGE_SIZE: usize = 100;
+const GEMINI_PAGE_SIZE: usize = 1000;
+const DEFAULT_MAX_TOKENS: u32 = 1500;
+const OPENAI_REASONING_MAX_TOKENS: u32 = 16_000;
+const ANTHROPIC_REASONING_MAX_TOKENS: u32 = 8_000;
 const AI_PROGRESS: u8 = 95;
 // A separate value keeps the AI phase distinct from local progress at 95%.
 const AI_PHASE: u8 = 101;
@@ -75,6 +85,27 @@ impl ProviderKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    #[default]
+    Default,
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    fn level(self) -> Option<(&'static str, u32)> {
+        match self {
+            Self::Default => None,
+            Self::Low => Some(("low", 1024)),
+            Self::Medium => Some(("medium", 8192)),
+            Self::High => Some(("high", 24576)),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AiConfig {
@@ -82,6 +113,7 @@ pub struct AiConfig {
     pub kind: ProviderKind,
     pub base_url: String,
     pub model: String,
+    pub effort: Effort,
 }
 
 impl Default for AiConfig {
@@ -91,7 +123,22 @@ impl Default for AiConfig {
             kind: ProviderKind::default(),
             base_url: ProviderKind::default().default_url().into(),
             model: String::new(),
+            effort: Effort::Default,
         }
+    }
+}
+
+impl AiConfig {
+    pub fn suggested_model<'a>(&self, models: &'a [ModelInfo]) -> Option<&'a ModelInfo> {
+        if self.kind == ProviderKind::OpenAiCompatible
+            && !validate_url(self.base_url.trim())
+                .ok()
+                .and_then(|uri| uri.host().map(is_openai_host))
+                .unwrap_or(false)
+        {
+            return models.first();
+        }
+        suggested_model(self.kind, models)
     }
 }
 
@@ -124,6 +171,11 @@ pub struct AiClient {
     key: Option<ApiKey>,
 }
 
+pub enum ConnectionTest {
+    Success,
+    UsedDefaultEffort,
+}
+
 impl AiClient {
     pub fn new(config: &AiConfig, key: Option<&ApiKey>) -> Self {
         Self {
@@ -136,8 +188,8 @@ impl AiClient {
         endpoint(&self.config, self.key.as_ref()).map(|_| ())
     }
 
-    pub fn test_connection(&self) -> Result<(), String> {
-        self.send("Reply with OK", &[], true).map(|_| ())
+    pub fn test_connection(&self) -> Result<ConnectionTest, String> {
+        self.send("Reply with OK", &[], true).map(|(_, test)| test)
     }
 
     fn request_verdict(&self, candidates: &[Thumbnail<'_>]) -> Result<AiVerdict, String> {
@@ -149,7 +201,7 @@ impl AiClient {
             .iter()
             .map(|&index| encode_jpeg(&candidates[index]).map(|jpeg| base64(&jpeg)))
             .collect::<Result<Vec<_>, _>>()?;
-        let text = self.send(&prompt(), &images, false)?;
+        let (text, _) = self.send(&prompt(), &images, false)?;
         let mut verdict = parse_verdict(&text, indices.len())?;
         for clip in &mut verdict.clips {
             clip.index = indices[clip.index];
@@ -170,40 +222,285 @@ impl AiClient {
         Ok(verdict)
     }
 
-    fn send(&self, text: &str, images: &[String], test: bool) -> Result<String, String> {
-        let request = build_request(&self.config, self.key.as_ref(), text, images, test)?;
-        let tls = TlsConfig::builder()
-            .provider(TlsProvider::NativeTls)
-            .root_certs(RootCerts::PlatformVerifier)
-            .build();
-        let mut config = ureq::Agent::config_builder()
-            .tls_config(tls)
-            .timeout_global(Some(TIMEOUT))
-            .http_status_as_error(false)
-            .max_redirects(0);
-        if request.uri().host().is_some_and(is_loopback) {
-            config = config.proxy(None);
-        }
-        let agent = ureq::Agent::new_with_config(config.build());
-        let mut response = agent.run(request).map_err(transport_error)?;
-        let status = response.status();
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(RESPONSE_LIMIT)
-            .read_to_vec();
-        if !status.is_success() {
-            return Err(http_error(
-                status.as_u16(),
-                &body.unwrap_or_default(),
-                self.key.as_ref(),
-            ));
-        }
-        let body = body.map_err(transport_error)?;
-        let envelope = serde_json::from_slice(&body)
-            .map_err(|_| "risposta del servizio non valida".to_owned())?;
-        response_text(self.config.kind, &envelope)
+    fn send(
+        &self,
+        text: &str,
+        images: &[String],
+        test: bool,
+    ) -> Result<(String, ConnectionTest), String> {
+        let key = self.key.as_ref();
+        let request = build_request(&self.config, key, text, images, test)?;
+        let agent = http_agent(request.uri());
+        let response = agent.run(request).map_err(transport_error)?;
+        let (response, outcome) = if response.status() == StatusCode::BAD_REQUEST
+            && self.config.effort != Effort::Default
+        {
+            drop(response);
+            let mut fallback = self.config.clone();
+            fallback.effort = Effort::Default;
+            let request = build_request(&fallback, key, text, images, test)?;
+            (
+                agent.run(request).map_err(transport_error)?,
+                ConnectionTest::UsedDefaultEffort,
+            )
+        } else {
+            (response, ConnectionTest::Success)
+        };
+        let envelope = read_json(response, key)?;
+        Ok((response_text(self.config.kind, &envelope)?, outcome))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub label: String,
+}
+
+/// Recupera un catalogo in memoria usando lo stesso trasporto delle richieste AI.
+pub fn list_models(config: &AiConfig, key: Option<&ApiKey>) -> Result<Vec<ModelInfo>, String> {
+    let (base, uri) = provider_base(config, key)?;
+    let host = uri.host().expect("validate_url richiede un host");
+    let kind = config.kind;
+    if key.is_none() && kind != ProviderKind::OpenAiCompatible && !is_loopback(host) {
+        return Err("chiave API mancante".into());
+    }
+    let agent = http_agent(&uri);
+    let (query, cursor_name) = match kind {
+        ProviderKind::OpenAiCompatible => (String::new(), ""),
+        ProviderKind::Anthropic => (format!("?limit={ANTHROPIC_PAGE_SIZE}"), "after_id"),
+        ProviderKind::Gemini => (format!("?pageSize={GEMINI_PAGE_SIZE}"), "pageToken"),
+    };
+    let first_page = format!("{base}/models{query}");
+    let mut url = first_page.clone();
+    let mut models = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_cursors = HashSet::new();
+    for _ in 0..MAX_MODEL_PAGES {
+        if key.is_some_and(|key| key.appears_in(&url)) {
+            return Err("la chiave coincide con una parte dell’indirizzo del servizio".into());
+        }
+        let request = provider_headers(Request::get(&url), kind, key)?
+            .body(())
+            .map_err(|_| "impossibile preparare la richiesta di elenco modelli")?;
+        let response = agent.run(request).map_err(transport_error)?;
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            return Err(
+                "Chiave API mancante o non valida: il servizio non ha concesso l’elenco dei modelli."
+                    .into(),
+            );
+        }
+        let body = read_json(response, key)?;
+        let (mut page, next) = parse_models(kind, host, &body);
+        if let Some(key) = key {
+            protect_model_secrets(&mut page, key);
+        }
+        models.extend(
+            page.into_iter()
+                .filter(|model| seen_ids.insert(model.id.clone())),
+        );
+        let Some(cursor) = next.filter(|cursor| {
+            !key.is_some_and(|key| key.appears_in(cursor)) && seen_cursors.insert(cursor.clone())
+        }) else {
+            break;
+        };
+        let cursor = utf8_percent_encode(&cursor, URL_COMPONENT_ESCAPE);
+        url = format!("{first_page}&{cursor_name}={cursor}");
+    }
+    Ok(models)
+}
+
+fn is_openai_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("api.openai.com")
+}
+
+fn parse_models(kind: ProviderKind, host: &str, body: &Value) -> (Vec<ModelInfo>, Option<String>) {
+    let official_openai = kind == ProviderKind::OpenAiCompatible && is_openai_host(host);
+    let excluded: &[&str] = match kind {
+        ProviderKind::OpenAiCompatible if official_openai => &[
+            "embedding",
+            "tts",
+            "whisper",
+            "dall-e",
+            "moderation",
+            "audio",
+            "realtime",
+            "transcribe",
+            "image",
+            "search",
+            "computer-use",
+            "babbage",
+            "davinci",
+        ],
+        ProviderKind::Gemini => &[
+            "embedding",
+            "aqa",
+            "imagen",
+            "veo",
+            "tts",
+            "image-generation",
+        ],
+        _ => &[],
+    };
+    let (items, next) = match kind {
+        ProviderKind::OpenAiCompatible => (&body["data"], None),
+        ProviderKind::Anthropic => (
+            &body["data"],
+            (body["has_more"].as_bool() == Some(true))
+                .then(|| body["last_id"].as_str())
+                .flatten(),
+        ),
+        ProviderKind::Gemini => (&body["models"], body["nextPageToken"].as_str()),
+    };
+    let mut entries: Vec<_> = items
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let (id, label) = match kind {
+                ProviderKind::OpenAiCompatible => (
+                    item["id"].as_str()?,
+                    item["display_name"]
+                        .as_str()
+                        .or_else(|| item["name"].as_str()),
+                ),
+                ProviderKind::Anthropic => (item["id"].as_str()?, item["display_name"].as_str()),
+                ProviderKind::Gemini => {
+                    let methods = item["supportedGenerationMethods"].as_array()?;
+                    if !methods.iter().any(|method| method == "generateContent") {
+                        return None;
+                    }
+                    let name = item["name"].as_str()?;
+                    (
+                        name.strip_prefix("models/").unwrap_or(name),
+                        item["displayName"].as_str(),
+                    )
+                }
+            };
+            let clean_id = id.trim();
+            if clean_id.is_empty()
+                || id.chars().any(char::is_control)
+                || clean_id.chars().count() > MAX_MODEL_ID_CHARS
+            {
+                return None;
+            }
+            if !excluded.is_empty() && contains_any(&clean_id.to_ascii_lowercase(), excluded) {
+                return None;
+            }
+            let label = label
+                .map(str::trim)
+                .filter(|label| !label.is_empty() && !label.chars().any(char::is_control))
+                .unwrap_or(clean_id);
+            Some((clean_id, label, item["created"].as_u64()))
+        })
+        .collect();
+    if official_openai {
+        entries.sort_by_key(|&(_, _, created)| Reverse(created));
+    }
+    let mut seen = HashSet::new();
+    let models = entries
+        .into_iter()
+        .filter(|&(id, _, _)| seen.insert(id))
+        .map(|(id, label, _)| ModelInfo {
+            id: id.into(),
+            label: label.into(),
+        })
+        .collect();
+    (
+        models,
+        next.filter(|cursor| !cursor.is_empty()).map(str::to_owned),
+    )
+}
+
+fn protect_model_secrets(models: &mut Vec<ModelInfo>, key: &ApiKey) {
+    models.retain(|model| !key.appears_in(&model.id));
+    for model in models {
+        model.label = key.redact(&model.label);
+    }
+}
+
+fn contains_any(text: &str, fragments: &[&str]) -> bool {
+    fragments.iter().any(|fragment| text.contains(fragment))
+}
+
+/// I modelli OpenAI sono già ordinati per data dal parser del catalogo ufficiale.
+pub fn suggested_model(kind: ProviderKind, models: &[ModelInfo]) -> Option<&ModelInfo> {
+    let preferred = match kind {
+        ProviderKind::Anthropic => models.first(),
+        ProviderKind::OpenAiCompatible => {
+            let mut compatible = models.iter().filter(|model| {
+                !contains_any(
+                    &model.id.to_ascii_lowercase(),
+                    &["-pro", "deep-research", "instruct", "audio", "search"],
+                )
+            });
+            return compatible
+                .clone()
+                .find(|model| {
+                    let id = model.id.to_ascii_lowercase();
+                    id.starts_with("gpt-")
+                        && !contains_any(&id, &["mini", "nano", "codex", "oss", "preview"])
+                })
+                .or_else(|| compatible.next());
+        }
+        ProviderKind::Gemini => models
+            .iter()
+            .enumerate()
+            .filter_map(|(index, model)| {
+                let id = model.id.to_ascii_lowercase();
+                if contains_any(&id, &["preview", "exp", "lite", "tts", "live"]) {
+                    return None;
+                }
+                let mut parts = id.strip_prefix("gemini-")?.split('-');
+                let version = parts.next()?;
+                let mut version = version
+                    .split('.')
+                    .map(str::parse::<u32>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                while version.last() == Some(&0) {
+                    version.pop();
+                }
+                let pro = parts.any(|part| part == "pro");
+                Some(((version, pro, Reverse(index)), model))
+            })
+            .max_by(|(a, _), (b, _)| a.cmp(b))
+            .map(|(_, model)| model),
+    };
+    preferred.or_else(|| models.first())
+}
+
+fn http_agent(uri: &Uri) -> Agent {
+    let tls = TlsConfig::builder()
+        .provider(TlsProvider::NativeTls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .build();
+    let mut config = Agent::config_builder()
+        .tls_config(tls)
+        .timeout_global(Some(TIMEOUT))
+        .http_status_as_error(false)
+        .max_redirects(0);
+    if uri.host().is_some_and(is_loopback) {
+        config = config.proxy(None);
+    }
+    Agent::new_with_config(config.build())
+}
+
+fn read_json(mut response: Response<Body>, key: Option<&ApiKey>) -> Result<Value, String> {
+    let status = response.status();
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(RESPONSE_LIMIT)
+        .read_to_vec();
+    if !status.is_success() {
+        return Err(http_error(status.as_u16(), &body.unwrap_or_default(), key));
+    }
+    let body = body.map_err(transport_error)?;
+    serde_json::from_slice(&body).map_err(|_| "risposta del servizio non valida".into())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -305,6 +602,11 @@ fn is_loopback(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "[::1]")
 }
 
+pub fn is_loopback_url(url: &str) -> bool {
+    validate_url(url.trim().trim_end_matches('/'))
+        .is_ok_and(|uri| uri.host().is_some_and(is_loopback))
+}
+
 fn validate_url(text: &str) -> Result<Uri, String> {
     let invalid = "indirizzo del servizio non valido";
     if text.contains(['?', '#', '\\']) {
@@ -323,39 +625,67 @@ fn validate_url(text: &str) -> Result<Uri, String> {
     }
 }
 
-fn endpoint(config: &AiConfig, key: Option<&ApiKey>) -> Result<String, String> {
+const URL_COMPONENT_ESCAPE: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+fn provider_base<'a>(config: &'a AiConfig, key: Option<&ApiKey>) -> Result<(&'a str, Uri), String> {
     let base = config.base_url.trim().trim_end_matches('/');
-    validate_url(base)?;
+    let uri = validate_url(base)?;
+    if key.is_some_and(|key| key.appears_in(base)) {
+        return Err("rimuovi la chiave dall’indirizzo del servizio".into());
+    }
+    Ok((base, uri))
+}
+
+fn endpoint(config: &AiConfig, key: Option<&ApiKey>) -> Result<String, String> {
+    let (base, _) = provider_base(config, key)?;
+    if key.is_none() && config.kind != ProviderKind::OpenAiCompatible {
+        return Err("chiave API mancante".into());
+    }
     let model = config.model.trim();
     if model.is_empty() {
         return Err("modello AI mancante".into());
     }
-    if key.is_none() && config.kind != ProviderKind::OpenAiCompatible {
-        return Err("chiave API mancante".into());
-    }
-    if key.is_some_and(|key| key.appears_in(base) || key.appears_in(model)) {
+    if key.is_some_and(|key| key.appears_in(model)) {
         return Err("rimuovi la chiave dall’indirizzo o dal nome del modello".into());
     }
     let suffix = match config.kind {
         ProviderKind::OpenAiCompatible => "chat/completions".into(),
         ProviderKind::Anthropic => "messages".into(),
-        ProviderKind::Gemini => {
-            const MODEL_ESCAPE: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
-                .remove(b'-')
-                .remove(b'.')
-                .remove(b'_')
-                .remove(b'~');
-            format!(
-                "models/{}:generateContent",
-                utf8_percent_encode(model, MODEL_ESCAPE)
-            )
-        }
+        ProviderKind::Gemini => format!(
+            "models/{}:generateContent",
+            utf8_percent_encode(model, URL_COMPONENT_ESCAPE)
+        ),
     };
     let url = format!("{base}/{suffix}");
     if key.is_some_and(|key| key.appears_in(&url)) {
         return Err("la chiave coincide con una parte dell’indirizzo del servizio".into());
     }
     Ok(url)
+}
+
+fn provider_headers(
+    mut request: Builder,
+    kind: ProviderKind,
+    key: Option<&ApiKey>,
+) -> Result<Builder, String> {
+    if let Some(key) = key {
+        let (name, secret) = match kind {
+            ProviderKind::OpenAiCompatible => ("authorization", format!("Bearer {}", key.0)),
+            ProviderKind::Anthropic => ("x-api-key", key.0.clone()),
+            ProviderKind::Gemini => ("x-goog-api-key", key.0.clone()),
+        };
+        let mut value = HeaderValue::from_str(&secret).map_err(|_| "chiave API non valida")?;
+        value.set_sensitive(true);
+        request = request.header(name, value);
+    }
+    if kind == ProviderKind::Anthropic {
+        request = request.header("anthropic-version", "2023-06-01");
+    }
+    Ok(request)
 }
 
 fn build_request(
@@ -365,35 +695,41 @@ fn build_request(
     images: &[String],
     test: bool,
 ) -> Result<Request<Vec<u8>>, String> {
-    let mut request =
-        Request::post(endpoint(config, key)?).header("content-type", "application/json");
-    if let Some(key) = key {
-        let (name, secret) = match config.kind {
-            ProviderKind::OpenAiCompatible => ("authorization", format!("Bearer {}", key.0)),
-            ProviderKind::Anthropic => ("x-api-key", key.0.clone()),
-            ProviderKind::Gemini => ("x-goog-api-key", key.0.clone()),
-        };
-        let mut value = HeaderValue::from_str(&secret).map_err(|_| "chiave API non valida")?;
-        value.set_sensitive(true);
-        request = request.header(name, value);
-    }
+    let request = provider_headers(
+        Request::post(endpoint(config, key)?).header("content-type", "application/json"),
+        config.kind,
+        key,
+    )?;
     let model = config.model.trim();
+    let effort = config.effort.level();
     let body = match config.kind {
         ProviderKind::OpenAiCompatible => {
             let mut content = vec![json!({"type":"text","text":text})];
             content.extend(images.iter().map(|data| {
                 json!({"type":"image_url","image_url":{"url":format!("data:{JPEG_MIME};base64,{data}")}})
             }));
-            json!({"model":model,"temperature":0.2,"max_tokens":1500,
-                "messages":[{"role":"user","content":content}]})
+            let mut body = json!({"model":model,"messages":[{"role":"user","content":content}]});
+            if let Some((level, _)) = effort {
+                body["reasoning_effort"] = json!(level);
+                body["max_completion_tokens"] = json!(OPENAI_REASONING_MAX_TOKENS);
+            } else {
+                body["temperature"] = json!(0.2);
+                body["max_tokens"] = json!(DEFAULT_MAX_TOKENS);
+            }
+            body
         }
         ProviderKind::Anthropic => {
-            request = request.header("anthropic-version", "2023-06-01");
             let mut content: Vec<_> = images.iter().map(|data| {
                 json!({"type":"image","source":{"type":"base64","media_type":JPEG_MIME,"data":data}})
             }).collect();
             content.push(json!({"type":"text","text":text}));
-            json!({"model":model,"max_tokens":1500,"messages":[{"role":"user","content":content}]})
+            let mut body = json!({"model":model,"max_tokens":DEFAULT_MAX_TOKENS,
+                "messages":[{"role":"user","content":content}]});
+            if let Some((level, _)) = effort {
+                body["output_config"] = json!({"effort":level});
+                body["max_tokens"] = json!(ANTHROPIC_REASONING_MAX_TOKENS);
+            }
+            body
         }
         ProviderKind::Gemini => {
             let mut parts = vec![json!({"text":text})];
@@ -405,6 +741,13 @@ fn build_request(
             let mut generation = json!({"temperature":0.2});
             if !test {
                 generation["responseMimeType"] = json!("application/json");
+            }
+            if let Some((level, budget)) = effort {
+                generation["thinkingConfig"] = if model.starts_with("gemini-2") {
+                    json!({"thinkingBudget":budget})
+                } else {
+                    json!({"thinkingLevel":level})
+                };
             }
             json!({"contents":[{"parts":parts}],"generationConfig":generation})
         }
@@ -426,7 +769,11 @@ fn transport_error(error: ureq::Error) -> String {
 fn http_error(status: u16, body: &[u8], key: Option<&ApiKey>) -> String {
     let body = String::from_utf8_lossy(body);
     let safe = match key {
-        Some(key) => key.redact(&body),
+        Some(key) => {
+            let json_key = json!(&key.0).to_string();
+            let escaped = &json_key[1..json_key.len() - 1];
+            key.redact(&body.replace(escaped, "•••"))
+        }
         None => body.into_owned(),
     };
     let detail: String = safe
@@ -449,11 +796,12 @@ fn http_error(status: u16, body: &[u8], key: Option<&ApiKey>) -> String {
 }
 
 fn response_text(kind: ProviderKind, body: &Value) -> Result<String, String> {
-    fn join_text(blocks: &Value) -> String {
+    fn join_text(blocks: &Value, accept: impl Fn(&Value) -> bool) -> String {
         blocks
             .as_array()
             .into_iter()
             .flatten()
+            .filter(|part| accept(part))
             .filter_map(|part| part["text"].as_str())
             .collect()
     }
@@ -462,8 +810,8 @@ fn response_text(kind: ProviderKind, body: &Value) -> Result<String, String> {
             .as_str()
             .unwrap_or_default()
             .to_owned(),
-        ProviderKind::Anthropic => join_text(&body["content"]),
-        ProviderKind::Gemini => join_text(&body["candidates"][0]["content"]["parts"]),
+        ProviderKind::Anthropic => join_text(&body["content"], |part| part["type"] == "text"),
+        ProviderKind::Gemini => join_text(&body["candidates"][0]["content"]["parts"], |_| true),
     };
     if text.trim().is_empty() {
         return Err("il servizio AI ha risposto senza testo".into());

@@ -100,7 +100,7 @@ fn arguments() -> Result<Option<Arguments>, String> {
                         .as_deref()
                         .and_then(|value| value.to_str())
                         .and_then(InitialPanel::parse)
-                        .ok_or("Pannello non valido. Scegli musica, sticker o testo.")?,
+                        .ok_or("Pannello non valido. Scegli musica, sticker, testo o modelli.")?,
                 );
             }
             Some("--export-movie") => {
