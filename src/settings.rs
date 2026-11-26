@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ai_cli::{self, CliTool},
-    ai_provider::{self, AiClient, AiConfig, ApiKey, ConnectionTest, ModelInfo, ProviderKind},
+    ai_provider::{
+        self, AiClient, AiConfig, ApiKey, ConnectionTest, Effort, ModelInfo, ProviderKind,
+    },
     app::Job,
     online::{self, Online},
     theme,
@@ -63,6 +65,22 @@ impl Default for Preferences {
             ai: AiConfig::default(),
         }
     }
+}
+
+fn migrate_legacy_ai_config(config: &mut AiConfig, has_key: bool) -> bool {
+    if has_key
+        || config.enabled
+        || config.kind != ProviderKind::OpenAiCompatible
+        || config.base_url.trim().trim_end_matches('/')
+            != ProviderKind::OpenAiCompatible.default_url()
+        || !config.model.is_empty()
+        || config.effort != Effort::Default
+        || !config.cli_path.is_empty()
+    {
+        return false;
+    }
+    *config = AiConfig::default();
+    true
 }
 
 #[derive(Default)]
@@ -236,6 +254,11 @@ impl Settings {
             result.ai_key = result
                 .key_path()
                 .and_then(|path| ai_provider::load_key(&path));
+            // Preserve the saved configuration when the key cannot be read.
+            let has_key = !matches!(result.ai_key, Ok(None));
+            if migrate_legacy_ai_config(&mut result.preferences.ai, has_key) {
+                result.save();
+            }
         }
         result
     }
@@ -475,7 +498,10 @@ impl Settings {
     fn ai_controls(&mut self, ui: &mut Ui) {
         let config = &mut self.preferences.ai;
         ui.checkbox(&mut config.enabled, "Usa la mia AI per l’Auto Edit");
-        let mut provider = config.kind as usize;
+        let mut provider = ProviderKind::ALL
+            .iter()
+            .position(|&kind| kind == config.kind)
+            .expect("il servizio AI deve essere presente in ProviderKind::ALL");
         let service = ui.label("Servizio");
         let combo = egui::ComboBox::from_id_salt("ai_provider")
             .selected_text(ProviderKind::LABELS[provider])
@@ -1054,7 +1080,6 @@ fn read_language<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai_provider::Effort;
 
     #[test]
     fn write_ignores_short_unsaved_key_fragment() {
@@ -1100,21 +1125,105 @@ mod tests {
     }
 
     #[test]
-    fn settings_keep_old_defaults_and_round_trip_ai_without_key() {
+    fn settings_default_to_codex_and_round_trip_ai_without_key() {
         let mut preferences: Preferences =
             serde_json::from_str(r#"{"language":"Italiano","performance":true,"online":false}"#)
                 .unwrap();
         assert!(preferences.performance);
         assert!(!preferences.online);
-        assert!(preferences.ai == AiConfig::default());
-        preferences.ai.enabled = true;
+        assert!(preferences.ai.enabled);
+        assert_eq!(preferences.ai.kind, ProviderKind::LocalCli);
+        assert_eq!(preferences.ai.cli_tool, CliTool::Codex);
+        preferences.ai.enabled = false;
         preferences.ai.model = "visione: \"uno,due\"".into();
         preferences.ai.effort = Effort::High;
         let json = serde_json::to_value(&preferences).unwrap();
         assert_eq!(json["ai"].as_object().unwrap().len(), 7);
         assert_eq!(json["ai"]["effort"], "high");
-        assert_eq!(json["ai"]["cli_tool"], "claude");
+        assert_eq!(json["ai"]["kind"], "local_cli");
+        assert_eq!(json["ai"]["cli_tool"], "codex");
         assert_eq!(json["ai"]["cli_path"], "");
         assert!(serde_json::from_value::<Preferences>(json).unwrap() == preferences);
+    }
+
+    #[test]
+    fn startup_migrates_only_untouched_legacy_ai_without_a_key() {
+        let legacy = AiConfig {
+            enabled: false,
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "  https://api.openai.com/v1/  ".into(),
+            cli_tool: CliTool::Claude,
+            ..AiConfig::default()
+        };
+        let mut migrated = legacy.clone();
+        assert!(migrate_legacy_ai_config(&mut migrated, false));
+        assert!(migrated == AiConfig::default());
+        assert!(!migrate_legacy_ai_config(&mut migrated, false));
+
+        for (mut config, has_key) in [
+            (legacy.clone(), true),
+            (
+                AiConfig {
+                    model: "manual".into(),
+                    ..legacy.clone()
+                },
+                false,
+            ),
+            (
+                AiConfig {
+                    kind: ProviderKind::Gemini,
+                    ..legacy.clone()
+                },
+                false,
+            ),
+            (
+                AiConfig {
+                    enabled: true,
+                    ..legacy.clone()
+                },
+                false,
+            ),
+            (
+                AiConfig {
+                    base_url: "https://example.org/v1".into(),
+                    ..legacy.clone()
+                },
+                false,
+            ),
+            (
+                AiConfig {
+                    effort: Effort::High,
+                    ..legacy.clone()
+                },
+                false,
+            ),
+            (
+                AiConfig {
+                    cli_path: "custom.exe".into(),
+                    ..legacy
+                },
+                false,
+            ),
+        ] {
+            let before = config.clone();
+            assert!(!migrate_legacy_ai_config(&mut config, has_key));
+            assert!(config == before);
+        }
+    }
+
+    #[test]
+    fn settings_show_the_suggested_codex_model_after_catalog_load() {
+        let mut config = AiConfig::default();
+        let mut catalog = ModelCatalog::default();
+        let models = ai_cli::parse_codex_models(
+            br#"{"models":[
+            {"slug":"later","visibility":"list","priority":20},
+            {"slug":"first","display_name":"First","visibility":"list","priority":1}
+        ]}"#,
+        )
+        .unwrap();
+        assert!(catalog.apply(&mut config, Ok(models)));
+        assert_eq!(config.model, "first");
+        assert_eq!(catalog.result, Some(Ok(Some("First".into()))));
     }
 }

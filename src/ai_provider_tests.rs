@@ -8,7 +8,7 @@ use std::{
 #[test]
 #[ignore = "usa la CLI Codex installata e l'abbonamento"]
 fn live_codex_cli_lists_models_and_reads_a_jpeg() {
-    let mut config = AiConfig {
+    let config = AiConfig {
         kind: ProviderKind::LocalCli,
         cli_tool: CliTool::Codex,
         cli_path: String::new(),
@@ -32,14 +32,16 @@ fn live_codex_cli_lists_models_and_reads_a_jpeg() {
     for model in models.iter().take(5) {
         eprintln!("Modello Codex: {}", model.id);
     }
-    config.model = config
+    let suggested = config
         .suggested_model(&models)
-        .expect("nessun modello Codex suggerito")
-        .id
-        .clone();
+        .expect("nessun modello Codex suggerito");
 
     let beach = RgbImage::from_fn(64, 64, |_, y| {
-        image::Rgb(if y < 32 { [135, 206, 235] } else { [238, 214, 175] })
+        image::Rgb(if y < 32 {
+            [135, 206, 235]
+        } else {
+            [238, 214, 175]
+        })
     });
     let jpeg = encode_jpeg(&Thumbnail {
         score: 0,
@@ -48,13 +50,14 @@ fn live_codex_cli_lists_models_and_reads_a_jpeg() {
     })
     .expect("impossibile codificare il JPEG di prova");
 
-    let client = AiClient::new(&config, None).with_model_catalog(&models);
+    let client = AiClient::new(&config, None);
     let prompt = r#"Reply ONLY with JSON: {"scene":"beach|nature|city|snow|sunset|night"}"#;
-    let (response, _) = client
+    let response = client
         .send(prompt, &[jpeg], false)
         .expect("la CLI Codex non ha risposto alla richiesta con il JPEG");
-    eprintln!("Risposta Codex: {response}");
-    assert!(response.contains(r#""scene""#));
+    eprintln!("Risposta Codex: {}", response.text);
+    assert!(response.text.contains(r#""scene""#));
+    assert_eq!(response.model, suggested.id);
 }
 
 #[test]
@@ -234,6 +237,7 @@ fn reasoning_menu_and_effective_effort_follow_provider_and_model() {
         assert_eq!(cfg.effective_effort(&[]), Default);
     }
     let mut cfg = config(ProviderKind::LocalCli);
+    cfg.cli_tool = CliTool::Claude;
     cfg.effort = Max;
     let claude = list_models(&cfg, None).unwrap();
     assert_eq!(
@@ -298,6 +302,7 @@ fn cli_validates_the_explicit_executable_without_an_api_url_or_key() {
         fs::remove_dir(&executable).unwrap();
         fs::write(&executable, b"test fixture").unwrap();
 
+        cfg.model.clear();
         for tool in CliTool::ALL {
             cfg.cli_tool = tool;
             assert!(AiClient::new(&cfg, None).validate().is_ok());
@@ -363,6 +368,79 @@ fn request_body(cfg: &AiConfig, test: bool) -> Value {
 }
 
 #[test]
+fn ai_defaults_to_codex_without_a_manual_model_or_path() {
+    let config = AiConfig::default();
+    assert!(config.enabled);
+    assert_eq!(config.kind, ProviderKind::LocalCli);
+    assert_eq!(config.cli_tool, CliTool::Codex);
+    assert!(config.base_url.is_empty());
+    assert!(config.model.is_empty());
+    assert_eq!(config.effort, Effort::Default);
+    assert!(config.cli_path.is_empty());
+    assert_eq!(ProviderKind::ALL[0], ProviderKind::LocalCli);
+    assert_eq!(CliTool::ALL[0], CliTool::Codex);
+    let without_kind: AiConfig = serde_json::from_value(json!({"enabled": false})).unwrap();
+    assert_eq!(without_kind.kind, ProviderKind::LocalCli);
+    assert!(!without_kind.enabled);
+}
+
+#[test]
+fn cli_resolves_an_empty_model_from_the_program_defaults() {
+    let catalog = ai_cli::parse_codex_models(
+        br#"{"models":[
+        {"slug":"later","visibility":"list","priority":20},
+        {"slug":"first","visibility":"list","priority":1}
+    ]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        ai_cli::resolve_model(CliTool::Codex, "", &catalog),
+        Ok("first")
+    );
+    assert_eq!(
+        ai_cli::resolve_model(CliTool::Codex, "", &[]),
+        Err("Nessun modello Codex disponibile: scegli un modello nelle Impostazioni.")
+    );
+    assert_eq!(
+        ai_cli::resolve_model(CliTool::Claude, "", &[]),
+        Ok("sonnet")
+    );
+    for tool in CliTool::ALL {
+        assert_eq!(ai_cli::resolve_model(tool, "manual", &[]), Ok("manual"));
+    }
+}
+
+#[test]
+fn auto_edit_falls_back_when_the_codex_executable_is_unavailable() {
+    ai_cli::with_temp_dir(|dir| {
+        let config = AiConfig {
+            cli_path: dir.join("missing.exe").to_string_lossy().into_owned(),
+            ..AiConfig::default()
+        };
+        let analysis = analyze(
+            Ok(AiClient::new(&config, None)),
+            &[Thumbnail {
+                score: 60,
+                rgb: &[15; 12],
+                size: (2, 2),
+            }],
+            true,
+            |_| {},
+        );
+        assert!(analysis.verdict.is_none());
+        let AnalysisSource::Local(reason) = analysis.source else {
+            panic!("attesa l’analisi locale");
+        };
+        assert_eq!(
+            reason,
+            "Il file .exe indicato non esiste o non è accessibile."
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn old_config_defaults_to_model_effort() {
     let cfg: AiConfig = serde_json::from_value(json!({
         "enabled":true,"kind":"gemini","base_url":"https://example.com/v1","model":"vision"
@@ -371,7 +449,8 @@ fn old_config_defaults_to_model_effort() {
     assert_eq!(cfg.effort, Effort::Default);
     let saved = serde_json::to_value(cfg).unwrap();
     assert_eq!(saved["effort"], "default");
-    assert_eq!(saved["cli_tool"], "claude");
+    assert_eq!(saved["kind"], "gemini");
+    assert_eq!(saved["cli_tool"], "codex");
     assert_eq!(saved["cli_path"], "");
 }
 
@@ -880,7 +959,7 @@ fn openai_round_trip_on_loopback() {
         write_mock_reply(&mut stream, "200 OK", &reply);
     });
     let client = AiClient::new(&cfg, Some(&ApiKey::new("mock-loopback-key").unwrap()));
-    let verdict = client
+    let (verdict, model) = client
         .request_verdict(&[Thumbnail {
             score: 60,
             rgb: &[15; 12],
@@ -888,6 +967,7 @@ fn openai_round_trip_on_loopback() {
         }])
         .unwrap();
     server.join().unwrap();
+    assert_eq!(model, "vision");
     assert_eq!(verdict.clips[0].score, Some(82));
     assert_eq!(verdict.clips[0].scene, Some(Scene::Snow));
 }

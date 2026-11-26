@@ -45,17 +45,18 @@ const CATALOG_LIMIT: usize = 8 * 1024 * 1024;
 const ERROR_LIMIT: usize = 300;
 const TOKEN_LIMIT: usize = 100;
 const OUTPUT_FILE: &str = "out.txt";
+pub(crate) const CLAUDE_DEFAULT_MODEL: &str = "sonnet";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CliTool {
-    #[default]
     Claude,
+    #[default]
     Codex,
 }
 
 impl CliTool {
-    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+    pub const ALL: [Self; 2] = [Self::Codex, Self::Claude];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -73,7 +74,9 @@ impl CliTool {
 }
 
 pub(crate) fn validate_config(config: &AiConfig) -> Result<(), String> {
-    validate_arguments(&config.model, None)?;
+    if !config.model.is_empty() {
+        validate_arguments(&config.model, None)?;
+    }
     if !config.cli_path.is_empty() && !has_exe_extension(Path::new(&config.cli_path)) {
         return Err("Il percorso del programma AI deve indicare un file .exe.".into());
     }
@@ -298,7 +301,7 @@ pub fn list_models(config: &AiConfig) -> Result<Vec<ModelInfo>, String> {
         CliTool::Claude => Ok([
             ("fable", "Fable (più recente)"),
             ("opus", "Opus (più recente)"),
-            ("sonnet", "Sonnet (più recente)"),
+            (CLAUDE_DEFAULT_MODEL, "Sonnet (più recente)"),
             ("haiku", "Haiku (più recente)"),
         ]
         .into_iter()
@@ -387,28 +390,56 @@ pub(crate) fn parse_codex_models(stdout: &[u8]) -> Result<Vec<ModelInfo>, String
         .collect())
 }
 
+pub(crate) fn resolve_model<'a>(
+    tool: CliTool,
+    configured: &'a str,
+    models: &'a [ModelInfo],
+) -> Result<&'a str, &'static str> {
+    if !configured.is_empty() {
+        return Ok(configured);
+    }
+    match tool {
+        CliTool::Claude => Ok(CLAUDE_DEFAULT_MODEL),
+        CliTool::Codex => models
+            .first()
+            .map(|model| model.id.as_str())
+            .ok_or("Nessun modello Codex disponibile: scegli un modello nelle Impostazioni."),
+    }
+}
+
 pub fn send(
     config: &AiConfig,
     catalog_effort: Option<Effort>,
     prompt: &str,
     images: &[Vec<u8>],
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let limits = RunLimits::new(REQUEST_TIMEOUT, OUTPUT_LIMIT);
     let executable = validated_executable(config)?;
+    // Auto Edit can start before the settings catalog has been loaded.
+    let automatic_model = config.model.is_empty();
+    let models = if config.cli_tool == CliTool::Codex
+        && (automatic_model || (catalog_effort.is_none() && config.effort != Effort::Default))
+    {
+        codex_models(&executable).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let model = resolve_model(config.cli_tool, &config.model, &models)?;
     let effort = catalog_effort
+        .filter(|_| !automatic_model)
         .unwrap_or_else(|| {
-            // Auto Edit can start before the settings catalog has been loaded.
-            let models = if config.cli_tool == CliTool::Codex && config.effort != Effort::Default {
-                codex_models(&executable).unwrap_or_default()
+            if automatic_model {
+                let mut resolved = config.clone();
+                resolved.model = model.to_owned();
+                resolved.effective_effort(&models)
             } else {
-                Vec::new()
-            };
-            config.effective_effort(&models)
+                config.effective_effort(&models)
+            }
         })
         .cli_level();
-    with_temp_dir(|dir| match config.cli_tool {
+    let response = with_temp_dir(|dir| match config.cli_tool {
         CliTool::Claude => {
-            let args = claude_args(&config.model, effort)?;
+            let args = claude_args(model, effort)?;
             let output = run_process(
                 &executable,
                 &args,
@@ -429,11 +460,12 @@ pub fn send(
                     Ok(path)
                 })
                 .collect::<Result<Vec<_>, &str>>()?;
-            let args = codex_args(dir, &config.model, effort, &images)?;
+            let args = codex_args(dir, model, effort, &images)?;
             let output = run_process(&executable, &args, dir, prompt.as_bytes().to_vec(), limits)?;
             read_codex_result(dir, &output.stderr.data)
         }
-    })
+    })?;
+    Ok((response, model.to_owned()))
 }
 
 fn read_codex_result(directory: &Path, stderr: &[u8]) -> Result<String, String> {

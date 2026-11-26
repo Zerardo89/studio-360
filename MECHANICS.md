@@ -437,16 +437,22 @@ cookie o dati dei file locali. Le richieste e le operazioni di cache girano su w
 
 In **Impostazioni → AI personale** si sceglie un servizio e un modello con visione. Per un servizio
 API si può indicare anche l’indirizzo.
-L’interruttore è spento per impostazione predefinita. **Prova connessione** invia «Reply with OK»
-come richiesta di solo testo. Per Ollama e LM Studio si usa il servizio compatibile OpenAI e si può
-lasciare vuota la chiave.
+L’AI per l’Auto Edit è attiva per impostazione predefinita e usa **Programma AI installato** con
+Codex. Indirizzo, modello e percorso iniziano vuoti e il livello di ragionamento è quello del
+modello. **Prova connessione** invia «Reply with OK» come richiesta di solo testo. Per Ollama e
+LM Studio si usa il servizio compatibile OpenAI e si può lasciare vuota la chiave.
+
+All’avvio l’app salva i nuovi valori AI se trova la vecchia configurazione mai modificata:
+AI disattivata, servizio compatibile OpenAI, indirizzo `https://api.openai.com/v1` (ignorando
+spazi esterni e barre finali), modello e percorso vuoti, ragionamento predefinito e chiave API
+assente. Le altre configurazioni conservano le preferenze salvate.
 
 | Servizio | Indirizzo predefinito | Formato |
 | --- | --- | --- |
+| Programma AI installato | Accesso già effettuato in Codex o Claude Code | Prompt su stdin, con file JPEG temporanei per Codex e JPEG in Base64 per Claude Code |
 | Compatibile OpenAI, incluso OpenRouter | `https://api.openai.com/v1` | POST `/chat/completions` con JPEG in URL dati e header `Authorization: Bearer` quando è presente una chiave |
 | Anthropic | `https://api.anthropic.com/v1` | POST `/messages` con blocchi immagine JPEG in Base64 e header `x-api-key` |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta` | POST `/models/{modello}:generateContent` con JPEG in Base64 nei dati inline e header `x-goog-api-key` |
-| Programma AI installato | Accesso già effettuato in Claude Code o Codex | Prompt su stdin, con JPEG in Base64 per Claude Code e file JPEG temporanei per Codex |
 
 **Aggiorna elenco modelli** scarica il catalogo in background quando internet è attivo. La card lo
 richiede anche al cambio di servizio, dopo il salvataggio della chiave e all’apertura se l’elenco è
@@ -500,22 +506,27 @@ il file. Per l’AI, `settings.json` salva il servizio, l’indirizzo, il modell
 ragionamento, lo stato dell’interruttore, il tipo di programma e il percorso indicato manualmente.
 La chiave viaggia nell’header della richiesta API e viene oscurata nei messaggi d’errore HTTP.
 
-### Claude Code e Codex
+### Codex e Claude Code
 
-**Programma AI installato (Claude Code, Codex) – senza chiave API** usa la sessione aperta nel
+**Programma AI installato (Codex, Claude Code) – senza chiave API** usa la sessione aperta nel
 programma scelto. Internet deve essere attivo nelle impostazioni. La card mostra il percorso
 trovato in background. **Sfoglia…** o il campo **Percorso del programma (facoltativo)** permettono
 di indicare un file `.exe`. La ricerca automatica consulta `PATH`, poi
 `%USERPROFILE%\.local\bin\claude.exe` per Claude Code e la posizione del pacchetto Store
 `OpenAI.Codex_2p2nqsd0c76g0` per Codex. Il percorso rilevato automaticamente resta in memoria.
 
-Claude Code offre gli alias `fable`, `opus`, `sonnet` e `haiku`, con `sonnet` suggerito. Il
-menu offre **Predefinito del modello**, **Basso**, **Medio**, **Alto**, **Molto alto** e **Massimo**.
+Claude Code offre gli alias `fable`, `opus`, `sonnet` e `haiku`, con `sonnet` suggerito e usato
+quando il modello è vuoto. Il menu offre **Predefinito del modello**, **Basso**, **Medio**,
+**Alto**, **Molto alto** e **Massimo**.
 Codex carica in background `debug models` e tiene i modelli con `visibility: "list"` in ordine
-crescente di `priority`. Suggerisce il primo modello. Per ciascun modello offre il livello
+crescente di `priority`. All’apertura delle Impostazioni seleziona e mostra il primo modello
+se il campo è vuoto. Se il campo è ancora vuoto all’avvio di Auto Edit o di **Prova connessione**,
+l’app interroga il catalogo e usa il primo modello. Per ciascun modello offre il livello
 predefinito e i livelli dichiarati dal catalogo tra `low`, `medium`, `high`, `xhigh` e `max`.
 Per un modello senza voce nel catalogo il menu offre il predefinito, `low`, `medium` e `high`.
-Quando il catalogo di Codex è indisponibile, si può usare il campo **Modello (manuale)**.
+Se il catalogo di Codex è indisponibile o vuoto e manca un modello, l’app chiede di sceglierne
+uno nelle Impostazioni. Si può indicare un ID nel campo **Modello (manuale)**.
+Se Codex non viene trovato, l’Auto Edit mostra il motivo e usa il risultato locale.
 Quando il livello salvato per la CLI è indisponibile, viene usato il predefinito del modello.
 
 Gli ID e i livelli passati alla CLI hanno al massimo 100 caratteri tra `A–Z`, `a–z`, `0–9` e

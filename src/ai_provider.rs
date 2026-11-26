@@ -63,25 +63,25 @@ const SCENES: &[(&str, Scene)] = &[
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
-    #[default]
     OpenAiCompatible,
     Anthropic,
     Gemini,
+    #[default]
     LocalCli,
 }
 
 impl ProviderKind {
     pub const ALL: [Self; 4] = [
+        Self::LocalCli,
         Self::OpenAiCompatible,
         Self::Anthropic,
         Self::Gemini,
-        Self::LocalCli,
     ];
-    pub const LABELS: &[&str] = &[
+    pub const LABELS: [&str; Self::ALL.len()] = [
+        "Programma AI installato (Codex, Claude Code) – senza chiave API",
         "Compatibile OpenAI (OpenAI, OpenRouter, Ollama, LM Studio…)",
         "Anthropic",
         "Google Gemini",
-        "Programma AI installato (Claude Code, Codex) – senza chiave API",
     ];
 
     pub fn default_url(self) -> &'static str {
@@ -159,7 +159,7 @@ pub struct AiConfig {
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             kind: ProviderKind::default(),
             base_url: ProviderKind::default().default_url().into(),
             model: String::new(),
@@ -197,7 +197,9 @@ impl AiConfig {
 
     pub fn suggested_model<'a>(&self, models: &'a [ModelInfo]) -> Option<&'a ModelInfo> {
         if self.kind == ProviderKind::LocalCli && self.cli_tool == CliTool::Claude {
-            return models.iter().find(|model| model.id == "sonnet");
+            return models
+                .iter()
+                .find(|model| model.id == ai_cli::CLAUDE_DEFAULT_MODEL);
         }
         if self.kind == ProviderKind::OpenAiCompatible
             && !validate_url(self.base_url.trim())
@@ -246,6 +248,12 @@ pub enum ConnectionTest {
     UsedDefaultEffort,
 }
 
+struct AiResponse {
+    text: String,
+    model: String,
+    connection: ConnectionTest,
+}
+
 impl AiClient {
     pub fn new(config: &AiConfig, key: Option<&ApiKey>) -> Self {
         Self {
@@ -270,10 +278,11 @@ impl AiClient {
     }
 
     pub fn test_connection(&self) -> Result<ConnectionTest, String> {
-        self.send("Reply with OK", &[], true).map(|(_, test)| test)
+        self.send("Reply with OK", &[], true)
+            .map(|response| response.connection)
     }
 
-    fn request_verdict(&self, candidates: &[Thumbnail<'_>]) -> Result<AiVerdict, String> {
+    fn request_verdict(&self, candidates: &[Thumbnail<'_>]) -> Result<(AiVerdict, String), String> {
         let indices = ranked_indices(candidates);
         if indices.is_empty() {
             return Err("nessuna miniatura disponibile".into());
@@ -282,8 +291,8 @@ impl AiClient {
             .iter()
             .map(|&index| encode_jpeg(&candidates[index]))
             .collect::<Result<Vec<_>, _>>()?;
-        let (text, _) = self.send(&prompt(), &images, false)?;
-        let mut verdict = parse_verdict(&text, indices.len())?;
+        let response = self.send(&prompt(), &images, false)?;
+        let mut verdict = parse_verdict(&response.text, indices.len())?;
         for clip in &mut verdict.clips {
             clip.index = indices[clip.index];
         }
@@ -300,18 +309,17 @@ impl AiClient {
                 .take(100)
                 .collect();
         }
-        Ok(verdict)
+        Ok((verdict, response.model))
     }
 
-    fn send(
-        &self,
-        text: &str,
-        images: &[Vec<u8>],
-        test: bool,
-    ) -> Result<(String, ConnectionTest), String> {
+    fn send(&self, text: &str, images: &[Vec<u8>], test: bool) -> Result<AiResponse, String> {
         if self.config.kind == ProviderKind::LocalCli {
-            return ai_cli::send(&self.config, self.cli_effort, text, images)
-                .map(|response| (response, ConnectionTest::Success));
+            let (text, model) = ai_cli::send(&self.config, self.cli_effort, text, images)?;
+            return Ok(AiResponse {
+                text,
+                model,
+                connection: ConnectionTest::Success,
+            });
         }
         let images: Vec<_> = images.iter().map(|jpeg| base64(jpeg)).collect();
         let key = self.key.as_ref();
@@ -333,7 +341,11 @@ impl AiClient {
             (response, ConnectionTest::Success)
         };
         let envelope = read_json(response, key)?;
-        Ok((response_text(self.config.kind, &envelope)?, outcome))
+        Ok(AiResponse {
+            text: response_text(self.config.kind, &envelope)?,
+            model: self.config.model.trim().to_owned(),
+            connection: outcome,
+        })
     }
 }
 
@@ -669,15 +681,13 @@ pub fn analyze(
             return Err(INTERNET_DISABLED.into());
         }
         progress(AI_PHASE);
-        let verdict = client.request_verdict(candidates)?;
-        let model = client.config.model.trim();
+        let (verdict, model) = client.request_verdict(candidates)?;
         let model = if client.config.kind == ProviderKind::LocalCli {
             format!("{} · {model}", client.config.cli_tool.label())
+        } else if let Some(key) = &client.key {
+            key.redact(&model)
         } else {
-            client
-                .key
-                .as_ref()
-                .map_or_else(|| model.to_owned(), |key| key.redact(model))
+            model
         };
         Ok((model, verdict))
     });
